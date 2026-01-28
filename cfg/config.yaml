@@ -1,0 +1,7 @@
+model_name: "random_forest" # see model_registry in _build_model method of train_model.py
+model_params:
+  n_estimators: 100
+  max_depth: 5
+
+stratify: false
+test_size: 0.2

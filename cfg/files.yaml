@@ -1,0 +1,16 @@
+files:
+  input_data:
+    path: input_data.csv
+    file_type: csv
+
+  prepared_data:
+    path: prepared_data.csv
+    file_type: csv
+
+  output_data:
+    path: output_data.csv
+    file_type: csv
+
+  snowflake_data:
+    path: query_data.sql
+    file_type: sql
