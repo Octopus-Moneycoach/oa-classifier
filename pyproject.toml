@@ -1,23 +1,23 @@
 [tool.poetry]
-name = "ds-template"
+name = "oa-classifier"
 version = "0.0.1"
 description = ""
-authors = ["Alison Tully <alison.tully@octopusmoney.com>"]
+authors = ["Ash Marzimin <ash.marzimin@octopusmoney.com>"]
 
 packages = [
-  { include = "ds_template" },
+  { include = "oa_classifier" },
   { include = "src" }
 ]
 
 [tool.poetry.scripts]
-pipeline = "ds_template.main:main"
+pipeline = "oa_classifier.main:main"
 
 [tool.poetry.dependencies]
 python = ">=3.12,<3.13"
 numpy = ">=1.26,<2.0"
 pandas = "^2.3.2"
 pyarrow = ">=14,<18"
-mlflow = "^2.7.1"
+mlflow = "^3.5.0"
 xgboost = "^2.0.1"
 snowflake-connector-python = "^3.3.1"
 snowflake-sqlalchemy = "^1.7.3"
