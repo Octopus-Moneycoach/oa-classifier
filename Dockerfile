@@ -15,9 +15,9 @@ WORKDIR ${APP_HOME}
 
 # System deps (build-essential helps on slim if anything needs compiling)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git \
-      curl \
-      build-essential \
+    git \
+    curl \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Poetry globally and tell it NOT to create venvs

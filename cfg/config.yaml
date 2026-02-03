@@ -1,4 +1,4 @@
-model_name: "random_forest" # see model_registry in _build_model method of train_model.py
+model_name: "xgboost" # see model_registry in _build_model method of train_model.py
 model_params:
   n_estimators: 100
   max_depth: 5
