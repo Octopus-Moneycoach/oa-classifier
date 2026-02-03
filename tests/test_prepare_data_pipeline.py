@@ -8,7 +8,16 @@ from src.pipelines.prepare_data import PrepareDataPipeline
 
 @pytest.fixture(name="data")
 def sample_df_fixture():
-    return pd.DataFrame({"col1": [1, 2, 3], "col2": ["A", "B", "C"]})
+    return pd.DataFrame(
+        {
+            "HARBOURID": [101, 102, 103],
+            "GENDER": ["F", "M", "F"],
+            "AGE": [29, 41, 35],
+            "CHANNEL": ["Web", "Phone", "Web"],
+            "EMPLOYERNAME": ["Acme", "Beta", "Acme"],
+            "HASOA": ["Yes", "No", "Yes"],
+        }
+    )
 
 
 def test_run_pipeline(data):
@@ -19,7 +28,10 @@ def test_run_pipeline(data):
         pipeline = PrepareDataPipeline()
         pipeline.run()
 
-        mock_read.assert_called_once_with(schema_obj="input_data")
+        mock_read.assert_called_once()
+        _, read_kwargs = mock_read.call_args
+        assert read_kwargs["schema_obj"] == "input_data"
+        assert "select" in read_kwargs["sql_query"].lower()
 
         mock_write.assert_called_once()
         _, kwargs = mock_write.call_args
