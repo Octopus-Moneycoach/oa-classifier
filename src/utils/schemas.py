@@ -80,6 +80,9 @@ output_data_schema = DataFrameSchema(
         "PREDICTION": Column(
             float, checks=Check.between(0, 1)
         ),  # Assuming prediction is a probability between 0 and 1
+        "PREDICTION_CATEGORY": Column(
+            str, checks=Check.isin(["Low", "Medium", "High"])
+        ),  # Assuming prediction category is one of these three
     }
 )
 

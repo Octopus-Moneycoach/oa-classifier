@@ -96,8 +96,10 @@ class TrainModelPipeline(Pipeline):
 
         # Add scaling and normalization
         X_train, X_test = self.scaler(X_train, X_test)
-        # Class imbalance handling
-        X_train, y_train = self.resample(X_train, y_train)
+
+        # Class imbalance handling via data resampling
+        # Alternatively use class_weight in model params
+        # X_train, y_train = self.resample(X_train, y_train)
 
         # Train & evaluate
         self.train(X_train, y_train)
@@ -126,7 +128,15 @@ class TrainModelPipeline(Pipeline):
             df_out = df.copy()
             if self.model is not None:
                 X_full = self._prepare_features(X)
-                df_out["PREDICTION"] = self.model.predict(X_full)
+                if hasattr(self.model, "predict_proba"):
+                    proba = self.model.predict_proba(X_full)
+                    # Class 1 probabilities
+                    pred_scores = pd.Series(proba[:, 1], index=X_full.index)
+
+                df_out["PREDICTION"] = pd.Series(pred_scores, index=X_full.index)
+                df_out["PREDICTION_CATEGORY"] = pd.qcut(
+                    df_out["PREDICTION"], q=3, labels=["Low", "Medium", "High"]
+                )
 
                 write_data(
                     df_out,
@@ -259,7 +269,13 @@ class TrainModelPipeline(Pipeline):
 
         y_pred = self.model.predict(features)
         report = classification_report(target, y_pred)
-        # logger.info("Classification Report:\n%s", report)
+
+        # extract metrics from classification report and log to MLflow
+        report_dict = classification_report(target, y_pred, output_dict=True)
+        for key, metrics in report_dict.items():
+            if key not in ["accuracy", "macro avg", "weighted avg"]:
+                for metric_name, value in metrics.items():
+                    mlflow.log_metric(f"Class {key}_{metric_name}", float(value))
 
         # Save report to a text file
         reports_dir = Path(os.getenv("LOCAL_REPORTS_PATH", "outputs/reports"))

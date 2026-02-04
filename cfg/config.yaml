@@ -1,7 +1,26 @@
-model_name: "xgboost" # see model_registry in _build_model method of train_model.py
+model_name: "random_forest" # see model_registry in _build_model method of train_model.py
 model_params:
-  n_estimators: 100
-  max_depth: 5
+  # set random_state for reproducibility
+  random_state: 42
 
-stratify: false
+  # for imbalanced datasets, consider using class_weight or resampling techniques
+  class_weight: "balanced"  # for sklearn models
+  #scale_pos_weight: 1.0 # for xgboost models
+
+  # random forest parameters example
+  n_estimators: 200
+  max_depth: 6
+
+  # xgboost parameters example
+  # n_estimators: 200
+  # max_depth: 6
+  # objective: "binary:logistic"
+  # learning_rate: 0.01
+
+  # logistic regression parameters example
+  # C: 1.0
+  # solver: "lbfgs"
+  # max_iter: 100
+
+stratify: true
 test_size: 0.2
