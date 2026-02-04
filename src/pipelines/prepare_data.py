@@ -33,8 +33,8 @@ class PrepareDataPipeline(Pipeline):
                     dc.channel as CHANNEL,
                     de.name as EMPLOYERNAME,
                     case
-                        when fcj.oastatus in ('Active', 'Completed') then 1
-                        else 0
+                        when fcj.oastatus in ('Active', 'Completed') then 'Yes'
+                        else 'No'
                     end as HASOA
                 from prod_analytics.fact_clientjourney fcj
                 inner join prod_analytics.dim_client dc on fcj.clientkey = dc.clientkey
@@ -42,7 +42,7 @@ class PrepareDataPipeline(Pipeline):
                 where 1 = 1
                 and pmgstatus in ('Active', 'Completed')
             """,
-            schema_obj=None,  # Ignore schema validation for now
+            schema_obj="input_data",  # Ignore schema validation for now
         )
         logger.info("Input data read. Shape: %s", df.shape)
 

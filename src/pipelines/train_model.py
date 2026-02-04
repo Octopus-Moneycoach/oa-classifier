@@ -123,28 +123,22 @@ class TrainModelPipeline(Pipeline):
             if self.model is not None:
                 mlflow.sklearn.log_model(self.model, artifact_path=self.model_name)
 
-            # Persist predictions for the full dataset to match schema
-            # Update so that this will instead read from original dataset + predictions
-            df_out = df.copy()
-            if self.model is not None:
-                X_full = self._prepare_features(X)
-                if hasattr(self.model, "predict_proba"):
-                    proba = self.model.predict_proba(X_full)
-                    # Class 1 probabilities
-                    pred_scores = pd.Series(proba[:, 1], index=X_full.index)
+        # Persist predictions for the full dataset to match schema
+        # Update so that this will instead read from original dataset + predictions
+        df_out = df.copy()
+        if self.model is not None:
+            X_full = self._prepare_features(X)
+            pred_scores = self._predict_scores(X_full)
+            df_out["PREDICTION"] = pd.Series(pred_scores, index=X_full.index)
+            df_out["PREDICTION_CATEGORY"] = self._bin_predictions(df_out["PREDICTION"])
 
-                df_out["PREDICTION"] = pd.Series(pred_scores, index=X_full.index)
-                df_out["PREDICTION_CATEGORY"] = pd.qcut(
-                    df_out["PREDICTION"], q=3, labels=["Low", "Medium", "High"]
-                )
-
-                write_data(
-                    df_out,
-                    table_name="OA_DATASET_OUTPUT",
-                    schema_obj=None,  # ignore schema validation for now
-                    database="TEST_DS_DATABASE",
-                    schema="PUBLIC",
-                )
+            write_data(
+                df_out,
+                table_name="OA_DATASET_OUTPUT",
+                schema_obj=None,  # ignore schema validation for now
+                database="TEST_DS_DATABASE",
+                schema="PUBLIC",
+            )
 
     def scaler(
         self, X_train: pd.DataFrame, X_test: pd.DataFrame
@@ -186,6 +180,41 @@ class TrainModelPipeline(Pipeline):
             index=X.index,
         )
         return X_scaled
+
+    def _predict_scores(self, features: pd.DataFrame) -> pd.Series:
+        """Generate prediction scores for downstream binning."""
+        if self.model is None:
+            raise RuntimeError("Model has not been trained.")
+        if hasattr(self.model, "predict_proba"):
+            proba = self.model.predict_proba(features)
+            return pd.Series(proba[:, 1], index=features.index)
+        if hasattr(self.model, "decision_function"):
+            scores = self.model.decision_function(features)
+            if hasattr(scores, "ndim") and scores.ndim > 1:
+                return pd.Series(scores[:, 1], index=features.index)
+            return pd.Series(scores, index=features.index)
+        preds = self.model.predict(features)
+        return pd.Series(preds, index=features.index)
+
+    def _bin_predictions(self, scores: pd.Series) -> pd.Series:
+        """Bin prediction scores into Low/Medium/High with safe fallbacks."""
+        scores = pd.Series(scores, index=scores.index)
+        unique_count = scores.nunique(dropna=True)
+        if unique_count <= 1:
+            return pd.Series(["Medium"] * len(scores), index=scores.index)
+        try:
+            cats = pd.qcut(scores, q=3, duplicates="drop")
+            n_bins = len(cats.cat.categories)
+            if n_bins == 1:
+                labels = ["Medium"]
+            elif n_bins == 2:
+                labels = ["Low", "High"]
+            else:
+                labels = ["Low", "Medium", "High"]
+            return pd.qcut(scores, q=3, labels=labels, duplicates="drop")
+        except ValueError:
+            labels = ["Low", "High"]
+            return pd.cut(scores, bins=2, labels=labels, include_lowest=True)
 
     def resample(
         self, X_train: pd.DataFrame, y_train: pd.Series
