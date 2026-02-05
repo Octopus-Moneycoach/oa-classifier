@@ -1,4 +1,5 @@
 import atexit
+import importlib
 import logging
 import os
 from pathlib import Path
@@ -14,7 +15,11 @@ from cryptography.hazmat.primitives import serialization
 from dotenv import dotenv_values
 from snowflake.connector.pandas_tools import write_pandas
 
-from src.utils.schemas import schemas
+import src.utils.schemas as schemas_module
+
+# Reload schemas in case schemas.py has changed
+schemas_module = importlib.reload(schemas_module)
+schemas = schemas_module.schemas
 
 _ENV_PATH = Path(".env")
 _created_env = False
@@ -212,6 +217,10 @@ def check_snowflake_connection() -> None:
         raise
 
 
+if __name__ == "__main__":
+    check_snowflake_connection()
+
+
 def read_data(
     sql_query: str | None = None,
     table_name: str | None = None,
@@ -261,16 +270,12 @@ def read_data(
         raise
 
     try:
-        if sql_query is None and table_name is None:
-            raise ValueError("Either sql_query or table_name must be provided.")
-        elif sql_query and table_name:
-            # If both are provided, prioritize sql_query and log a warning
-            logger.warning(
-                "Both sql_query and table_name provided. Using sql_query and ignoring table_name."
-            )
+        if sql_query:
             df = pd.read_sql(sql_query, conn)
-        else:
+        elif table_name:
             df = pd.read_sql(f"SELECT * FROM {table_name};", conn)
+        else:
+            raise ValueError("Either sql_query or table_name must be provided.")
         logger.info(f"Data successfully read from Snowflake. Shape: {df.shape}")
 
         if schema_obj:
@@ -330,14 +335,18 @@ def write_data(
         logger.error(f"Error connecting to Snowflake: {exc}")
         raise
 
+    print(df.head())
+    logger.info(f"Database to write to: {database}, Schema: {schema}")
+    logger.info(f"Writing data to Snowflake table '{table_name}'.")
+
     try:
         success, _, nrows, _ = write_pandas(
             conn=conn,
             df=df,
-            table_name=table_name,  # check
+            table_name=table_name,
             schema=schema,
             quote_identifiers=True,
-            auto_create_table=True,  # check
+            auto_create_table=True,
             overwrite=True,
         )
 

@@ -29,23 +29,22 @@ jobs:
       - name: Install Poetry
         uses: snok/install-poetry@v1
         with:
-          virtualenvs-in-project: true     # puts .venv in the repo (good for caching)
-          installer-parallel: true
+          virtualenvs-in-project: true
+          installer-parallel: false
 
-      - name: Cache Poetry virtualenv and cache
+      - name: Cache Poetry downloads
         uses: actions/cache@v4
         with:
           path: |
-            .venv
             ~/.cache/pypoetry
-          key: ${{ runner.os }}-py${{ steps.setup-python.outputs.python-version || '3.12' }}-poetry-${{ hashFiles('**/poetry.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-py${{ steps.setup-python.outputs.python-version || '3.12' }}-poetry-
+            ~/.cache/pip
+          key: ${{ runner.os }}-py3.12-poetry-${{ hashFiles('**/poetry.lock') }}
 
       - name: Install dependencies (incl. dev)
         run: |
+          rm -rf .venv
           poetry --version
-          poetry install --with dev --no-interaction --no-ansi
+          poetry install --with dev --no-interaction --no-ansi --sync
 
       - name: Run tests (pytest)
         run: |

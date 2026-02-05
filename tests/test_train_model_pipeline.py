@@ -61,16 +61,8 @@ def test_pipeline_run(pipeline, data):
         table_name = kwargs["table_name"]
         schema_obj = kwargs["schema_obj"]
         assert "PREDICTION" in data.columns
-        assert table_name == "TEST_DS_TABLE_IRIS_OUTPUT"
-        assert schema_obj == "output_data"
-
-        # # Ensure predictions were written for the full dataset under the expected key/env
-        # mock_write.assert_called_once()
-        # args, _ = mock_write.call_args
-        # df_out, table_name, schema_obj = args
-        # assert "PREDICTION" in df_out.columns
-        # assert table_name == "TEST_DS_TABLE_IRIS_OUTPUT"
-        # assert schema_obj == "output_data"
+        assert table_name == "OA_DATASET_OUTPUT"
+        assert schema_obj is None
 
 
 def test_train_method(pipeline, data):

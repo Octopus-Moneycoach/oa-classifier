@@ -9,10 +9,13 @@ import mlflow.sklearn
 import pandas as pd
 import xgboost as xgb
 from dotenv import load_dotenv
+from imblearn.over_sampling import SMOTE
 from sklearn.base import BaseEstimator
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, auc, classification_report, roc_curve
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 
 from src.pipelines.pipeline import Pipeline
 from src.utils.utils import (
@@ -59,6 +62,8 @@ class TrainModelPipeline(Pipeline):
             self.model_params = raw_params
         self.run_name = run_name or "Default_Run_Name"
         self.model: Optional[BaseEstimator] = None
+        self.scaler_: Optional[StandardScaler] = None
+        self.feature_cols_: Optional[pd.Index] = None
 
     def run(self) -> None:
         """Execute training and log metrics, model, and plots to MLflow."""
@@ -70,7 +75,10 @@ class TrainModelPipeline(Pipeline):
 
         # Load data
         df = read_data(
-            table_name="TEST_DS_TABLE_IRIS_PREPARED", schema_obj="prepared_data"
+            table_name="OA_DATASET_PREPARED",
+            schema_obj=None,  # Ignore schema validation for now
+            database="TEST_DS_DATABASE",
+            schema="PUBLIC",
         )
         target_col = df.columns[-1]
         X = df.drop(columns=[target_col])
@@ -85,6 +93,13 @@ class TrainModelPipeline(Pipeline):
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_size, random_state=random_state, stratify=stratify
         )
+
+        # Add scaling and normalization
+        X_train, X_test = self.scaler(X_train, X_test)
+
+        # Class imbalance handling via data resampling
+        # Alternatively use class_weight in model params
+        # X_train, y_train = self.resample(X_train, y_train)
 
         # Train & evaluate
         self.train(X_train, y_train)
@@ -108,16 +123,115 @@ class TrainModelPipeline(Pipeline):
             if self.model is not None:
                 mlflow.sklearn.log_model(self.model, artifact_path=self.model_name)
 
-            # Persist predictions for the full dataset to match schema
-            df_out = df.copy()
-            if self.model is not None:
-                df_out["PREDICTION"] = self.model.predict(X)
+        # Persist predictions for the full dataset to match schema
+        # Update so that this will instead read from original dataset + predictions
+        df_out = df.copy()
+        if self.model is not None:
+            X_full = self._prepare_features(X)
+            pred_scores = self._predict_scores(X_full)
+            df_out["PREDICTION"] = pd.Series(pred_scores, index=X_full.index)
+            df_out["PREDICTION_CATEGORY"] = self._bin_predictions(df_out["PREDICTION"])
 
-                write_data(
-                    df_out,
-                    table_name="TEST_DS_TABLE_IRIS_OUTPUT",
-                    schema_obj="output_data",
-                )
+            write_data(
+                df_out,
+                table_name="OA_DATASET_OUTPUT",
+                schema_obj=None,  # ignore schema validation for now
+                database="TEST_DS_DATABASE",
+                schema="PUBLIC",
+            )
+
+    def scaler(
+        self, X_train: pd.DataFrame, X_test: pd.DataFrame
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Scale features using StandardScaler.
+
+        Args:
+            X_train: Training feature matrix.
+            X_test: Testing feature matrix.
+
+        Returns:
+            Tuple of scaled (X_train, X_test).
+        """
+        logger.info("Scaling features using StandardScaler.")
+        scaler = StandardScaler()
+        num_cols = X_train.select_dtypes(include="number").columns
+        X_train_scaled = pd.DataFrame(
+            scaler.fit_transform(X_train[num_cols]),
+            columns=num_cols,
+            index=X_train.index,
+        )
+        X_test_scaled = pd.DataFrame(
+            scaler.transform(X_test[num_cols]),
+            columns=num_cols,
+            index=X_test.index,
+        )
+        self.scaler_ = scaler
+        self.feature_cols_ = num_cols
+        return X_train_scaled, X_test_scaled
+
+    def _prepare_features(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Align prediction features with the fitted scaler/feature set."""
+        if self.scaler_ is None or self.feature_cols_ is None:
+            raise RuntimeError("Scaler has not been fitted.")
+        X_num = X[self.feature_cols_]
+        X_scaled = pd.DataFrame(
+            self.scaler_.transform(X_num),
+            columns=self.feature_cols_,
+            index=X.index,
+        )
+        return X_scaled
+
+    def _predict_scores(self, features: pd.DataFrame) -> pd.Series:
+        """Generate prediction scores for downstream binning."""
+        if self.model is None:
+            raise RuntimeError("Model has not been trained.")
+        if hasattr(self.model, "predict_proba"):
+            proba = self.model.predict_proba(features)
+            return pd.Series(proba[:, 1], index=features.index)
+        if hasattr(self.model, "decision_function"):
+            scores = self.model.decision_function(features)
+            if hasattr(scores, "ndim") and scores.ndim > 1:
+                return pd.Series(scores[:, 1], index=features.index)
+            return pd.Series(scores, index=features.index)
+        preds = self.model.predict(features)
+        return pd.Series(preds, index=features.index)
+
+    def _bin_predictions(self, scores: pd.Series) -> pd.Series:
+        """Bin prediction scores into Low/Medium/High with safe fallbacks."""
+        scores = pd.Series(scores, index=scores.index)
+        unique_count = scores.nunique(dropna=True)
+        if unique_count <= 1:
+            return pd.Series(["Medium"] * len(scores), index=scores.index)
+        try:
+            cats = pd.qcut(scores, q=3, duplicates="drop")
+            n_bins = len(cats.cat.categories)
+            if n_bins == 1:
+                labels = ["Medium"]
+            elif n_bins == 2:
+                labels = ["Low", "High"]
+            else:
+                labels = ["Low", "Medium", "High"]
+            return pd.qcut(scores, q=3, labels=labels, duplicates="drop")
+        except ValueError:
+            labels = ["Low", "High"]
+            return pd.cut(scores, bins=2, labels=labels, include_lowest=True)
+
+    def resample(
+        self, X_train: pd.DataFrame, y_train: pd.Series
+    ) -> tuple[pd.DataFrame, pd.Series]:
+        """Handle class imbalance using SMOTE.
+
+        Args:
+            X_train: Training feature matrix.
+            y_train: Training target series.
+
+        Returns:
+            Tuple of resampled (X_train, y_train).
+        """
+        logger.info("Applying SMOTE to handle class imbalance.")
+        smote = SMOTE(random_state=42)
+        X_resampled, y_resampled = smote.fit_resample(X_train, y_train)
+        return X_resampled, y_resampled
 
     def train(self, features: pd.DataFrame, target: pd.Series) -> None:
         """Fit the configured classifier.
@@ -160,6 +274,8 @@ class TrainModelPipeline(Pipeline):
 
         """
         model_registry = {
+            "logistic_regression": LogisticRegression,
+            "lr": LogisticRegression,
             "xgboost": xgb.XGBClassifier,
             "xgb": xgb.XGBClassifier,
             "random_forest": RandomForestClassifier,
@@ -182,7 +298,13 @@ class TrainModelPipeline(Pipeline):
 
         y_pred = self.model.predict(features)
         report = classification_report(target, y_pred)
-        # logger.info("Classification Report:\n%s", report)
+
+        # extract metrics from classification report and log to MLflow
+        report_dict = classification_report(target, y_pred, output_dict=True)
+        for key, metrics in report_dict.items():
+            if key not in ["accuracy", "macro avg", "weighted avg"]:
+                for metric_name, value in metrics.items():
+                    mlflow.log_metric(f"Class {key}_{metric_name}", float(value))
 
         # Save report to a text file
         reports_dir = Path(os.getenv("LOCAL_REPORTS_PATH", "outputs/reports"))
