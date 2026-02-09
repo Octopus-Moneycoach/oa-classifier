@@ -464,17 +464,25 @@ class TrainModelPipeline(Pipeline):
             feature_names=X_test.columns.tolist(),
         )
         
-        # Pick a sample to explain (e.g., highest prediction)
+                # Waterfall plots for low, mid, high predictions
         if hasattr(self.model, "predict_proba"):
             proba = self.model.predict_proba(X_test)[:, 1]
-            high_idx = int(np.argmax(proba))
             
-            plt.figure()
-            shap.waterfall_plot(explanation[high_idx], show=False)
-            waterfall_path = shap_dir / "shap_waterfall_high.png"
-            plt.savefig(waterfall_path, bbox_inches="tight", dpi=150)
-            plt.close()
-            logger.info(f"SHAP waterfall (highest pred) saved to {waterfall_path}")
-            mlflow.log_artifact(str(waterfall_path), artifact_path="shap")
+            samples = {
+                "low": int(np.argmin(proba)),
+                "mid": int(np.argsort(proba)[len(proba) // 2]),
+                "high": int(np.argmax(proba)),
+            }
+            
+            for label, idx in samples.items():
+                plt.figure()
+                shap.waterfall_plot(explanation[idx], show=False)
+                waterfall_path = shap_dir / f"shap_waterfall_{label}.png"
+                plt.savefig(waterfall_path, bbox_inches="tight", dpi=150)
+                plt.close()
+                
+                pred_prob = proba[idx]
+                logger.info(f"SHAP waterfall ({label}, p={pred_prob:.3f}) saved to {waterfall_path}")
+                mlflow.log_artifact(str(waterfall_path), artifact_path="shap")
 
 
