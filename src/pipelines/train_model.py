@@ -425,5 +425,16 @@ class TrainModelPipeline(Pipeline):
             bar_len = int(row["mean_abs_shap"] * 50)  # Simple visual bar
             bar = "█" * bar_len
             logger.info(f"  {row['feature']:30s} {row['mean_abs_shap']:.4f} {bar}")
+        
+        plots_dir = Path(os.getenv("LOCAL_PLOTS_PATH", "outputs/plots"))
+        shap_dir = plots_dir / "shap"
+        shap_dir.mkdir(parents=True, exist_ok=True)
+        
+        csv_path = shap_dir / "shap_feature_importance.csv"
+        feature_importance.to_csv(csv_path, index=False)
+        logger.info(f"SHAP feature importance saved to {csv_path}")
+        
+        # Log to MLflow for experiment tracking
+        mlflow.log_artifact(str(csv_path), artifact_path="shap")
 
 
