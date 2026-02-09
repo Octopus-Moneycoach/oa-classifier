@@ -454,5 +454,27 @@ class TrainModelPipeline(Pipeline):
         plt.close()
         logger.info(f"SHAP beeswarm plot saved to {summary_path}")
         mlflow.log_artifact(str(summary_path), artifact_path="shap")
+        
+        # Waterfall plot for individual explanation ===
+        # Create Explanation object (required for waterfall)
+        explanation = shap.Explanation(
+            values=shap_values,
+            base_values=explainer.expected_value,
+            data=X_test.values,
+            feature_names=X_test.columns.tolist(),
+        )
+        
+        # Pick a sample to explain (e.g., highest prediction)
+        if hasattr(self.model, "predict_proba"):
+            proba = self.model.predict_proba(X_test)[:, 1]
+            high_idx = int(np.argmax(proba))
+            
+            plt.figure()
+            shap.waterfall_plot(explanation[high_idx], show=False)
+            waterfall_path = shap_dir / "shap_waterfall_high.png"
+            plt.savefig(waterfall_path, bbox_inches="tight", dpi=150)
+            plt.close()
+            logger.info(f"SHAP waterfall (highest pred) saved to {waterfall_path}")
+            mlflow.log_artifact(str(waterfall_path), artifact_path="shap")
 
 
