@@ -391,5 +391,24 @@ class TrainModelPipeline(Pipeline):
         logger.info(f"Shape: {shap_values.shape}")
         logger.info(f"X_test shape: {X_test.shape}")
         logger.info(f"Expected value (base rate): {explainer.expected_value}")
+        sample_idx = 0
+        sample_shap = shap_values[sample_idx]
+        sample_features = X_test.iloc[sample_idx]
+        
+        logger.info(f"\n--- Sample {sample_idx} SHAP breakdown ---")
+        for feat, shap_val, feat_val in zip(X_test.columns, sample_shap, sample_features):
+            direction = "↑" if shap_val > 0 else "↓" if shap_val < 0 else "–"
+            logger.info(f"  {feat}: {shap_val:+.4f} {direction} (value={feat_val:.2f})")
+        
+        # Verify additivity: base + sum(shap) = raw prediction
+        shap_sum = sample_shap.sum()
+        raw_prediction = explainer.expected_value + shap_sum
+        logger.info(f"\nBase value: {explainer.expected_value:.4f}")
+        logger.info(f"Sum of SHAP: {shap_sum:+.4f}")
+        logger.info(f"Raw prediction (log-odds): {raw_prediction:.4f}")
+        
+        # Convert to probability
+        probability = 1 / (1 + np.exp(-raw_prediction))
+        logger.info(f"Probability (class 1): {probability:.4f}")
 
 
