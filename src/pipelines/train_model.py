@@ -427,7 +427,57 @@ class TrainModelPipeline(Pipeline):
         plt.savefig(summary_path, bbox_inches="tight", dpi=150)
         plt.close()
         mlflow.log_artifact(str(summary_path), artifact_path="shap")
-        
+
+        # Cohort analysis: mean SHAP per prediction bucket
+        if hasattr(self.model, "predict_proba"):
+            proba = self.model.predict_proba(X_test)[:, 1]
+
+            # Split into terciles
+            bucket_labels = pd.qcut(proba, q=3, labels=["low", "mid", "high"])
+
+            # Calculate mean SHAP (directional) per bucket
+            shap_df = pd.DataFrame(shap_values, columns=X_test.columns, index=X_test.index)
+            shap_df["bucket"] = np.array(bucket_labels, dtype=str)
+
+            cohort_shap = shap_df.groupby("bucket", observed=True).mean().T
+            cohort_shap.index.name = "feature"
+            cohort_shap = cohort_shap.reset_index()
+
+            # Reorder columns (only include those that exist)
+            cols = ["feature"] + [c for c in ["low", "mid", "high"] if c in cohort_shap.columns]
+            cohort_shap = cohort_shap[cols]
+
+            # Sort by absolute difference between high and low
+            if "high" in cohort_shap.columns and "low" in cohort_shap.columns:
+                cohort_shap["spread"] = cohort_shap["high"] - cohort_shap["low"]
+                cohort_shap = cohort_shap.sort_values("spread", ascending=False)
+                cohort_shap = cohort_shap.drop(columns=["spread"])
+
+            cohort_path = shap_dir / "shap_cohort_analysis.csv"
+            cohort_shap.to_csv(cohort_path, index=False)
+            mlflow.log_artifact(str(cohort_path), artifact_path="shap")
+
+            # SHAP grouped bar plot by cohort
+            cohort_explanations = {}
+            for bucket_name in ["Low", "Mid", "High"]:
+                mask = shap_df["bucket"] == bucket_name.lower()
+                bucket_shap = shap_values[mask.values]
+                cohort_explanations[bucket_name] = shap.Explanation(
+                    values=bucket_shap,
+                    base_values=explainer.expected_value,
+                    data=X_test[mask].values,
+                    feature_names=X_test.columns.tolist(),
+                )
+
+            plt.figure()
+            shap.plots.bar(cohort_explanations, show=False)
+            cohort_chart_path = shap_dir / "shap_cohort_chart.png"
+            plt.savefig(cohort_chart_path, bbox_inches="tight", dpi=150)
+            plt.close()
+            mlflow.log_artifact(str(cohort_chart_path), artifact_path="shap")
+
+            logger.info("SHAP cohort analysis saved.")
+
         # Waterfall plots for low, mid, high predictions
         explanation = shap.Explanation(
             values=shap_values,
