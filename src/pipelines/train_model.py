@@ -428,11 +428,26 @@ class TrainModelPipeline(Pipeline):
         plt.close()
         mlflow.log_artifact(str(summary_path), artifact_path="shap")
 
+        # Dependence (scatter) plots for top features
+        top_features = feature_importance.head(3)["feature"].tolist()
+        for feat in top_features:
+            plt.figure()
+            shap.dependence_plot(
+                feat,
+                shap_values,
+                X_test,
+                show=False,
+            )
+            scatter_path = shap_dir / f"shap_scatter_{feat.lower()}.png"
+            plt.savefig(scatter_path, bbox_inches="tight", dpi=150)
+            plt.close()
+            mlflow.log_artifact(str(scatter_path), artifact_path="shap")
+
         # Cohort analysis: mean SHAP per prediction bucket
         if hasattr(self.model, "predict_proba"):
             proba = self.model.predict_proba(X_test)[:, 1]
 
-            # Split into terciles
+            # Split into buckets
             bucket_labels = pd.qcut(proba, q=3, labels=["low", "mid", "high"])
 
             # Calculate mean SHAP (directional) per bucket
