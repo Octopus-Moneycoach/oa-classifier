@@ -445,5 +445,14 @@ class TrainModelPipeline(Pipeline):
         plt.close()
         logger.info(f"SHAP bar plot saved to {bar_path}")
         mlflow.log_artifact(str(bar_path), artifact_path="shap")
+        
+        # Beeswarm plot (shows feature value → SHAP relationship)
+        plt.figure()
+        shap.summary_plot(shap_values, X_test, show=False)  # default is beeswarm
+        summary_path = shap_dir / "shap_beeswarm.png"
+        plt.savefig(summary_path, bbox_inches="tight", dpi=150)
+        plt.close()
+        logger.info(f"SHAP beeswarm plot saved to {summary_path}")
+        mlflow.log_artifact(str(summary_path), artifact_path="shap")
 
 
