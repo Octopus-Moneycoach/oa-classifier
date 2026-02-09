@@ -6,7 +6,9 @@ from typing import Optional
 import matplotlib.pyplot as plt
 import mlflow
 import mlflow.sklearn
+import numpy as np
 import pandas as pd
+import shap
 import xgboost as xgb
 from dotenv import load_dotenv
 from imblearn.over_sampling import SMOTE
@@ -118,6 +120,9 @@ class TrainModelPipeline(Pipeline):
 
             # ROC on the test set
             self._log_roc_curve(X_test, y_test)
+            
+            # SHAP analysis
+            self._log_shap_analysis(X_test)
 
             # Log model
             if self.model is not None:
@@ -366,3 +371,25 @@ class TrainModelPipeline(Pipeline):
         mlflow.log_artifact(str(roc_path), artifact_path=roc_path.parent.name)
 
         logger.info("ROC curve saved locally to %s and logged to MLflow.", roc_path)
+        
+    def _log_shap_analysis(self, X_test: pd.DataFrame) -> None:
+        """Calculate SHAP values and log their shape."""
+        logger.info("Starting SHAP analysis.")
+        
+        if self.model is None:
+            logger.warning("Model not available; skipping SHAP analysis.")
+            return
+
+        # TreeExplainer: exact SHAP for tree models (XGBoost, RF, LightGBM)
+        explainer = shap.TreeExplainer(self.model)
+        
+        # Compute SHAP values
+        shap_values = explainer.shap_values(X_test)
+        
+        # Log shape to understand the structure
+        logger.info(f"Type of shap_values: {type(shap_values)}")
+        logger.info(f"Shape: {shap_values.shape}")
+        logger.info(f"X_test shape: {X_test.shape}")
+        logger.info(f"Expected value (base rate): {explainer.expected_value}")
+
+
