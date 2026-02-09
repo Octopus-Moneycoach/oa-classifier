@@ -436,5 +436,14 @@ class TrainModelPipeline(Pipeline):
         
         # Log to MLflow for experiment tracking
         mlflow.log_artifact(str(csv_path), artifact_path="shap")
+        
+        # Bar plot (mean |SHAP| visualization) 
+        plt.figure()
+        shap.summary_plot(shap_values, X_test, plot_type="bar", show=False)
+        bar_path = shap_dir / "shap_bar.png"
+        plt.savefig(bar_path, bbox_inches="tight", dpi=150)
+        plt.close()
+        logger.info(f"SHAP bar plot saved to {bar_path}")
+        mlflow.log_artifact(str(bar_path), artifact_path="shap")
 
 
