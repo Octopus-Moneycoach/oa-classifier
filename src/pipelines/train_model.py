@@ -411,4 +411,19 @@ class TrainModelPipeline(Pipeline):
         probability = 1 / (1 + np.exp(-raw_prediction))
         logger.info(f"Probability (class 1): {probability:.4f}")
 
+        # Mean |SHAP| = average impact magnitude across all samples
+        mean_abs_shap = np.abs(shap_values).mean(axis=0)
+        
+        # Create sorted DataFrame
+        feature_importance = pd.DataFrame({
+            "feature": X_test.columns,
+            "mean_abs_shap": mean_abs_shap
+        }).sort_values("mean_abs_shap", ascending=False)
+        
+        logger.info("\n--- Global Feature Importance (mean |SHAP|) ---")
+        for _, row in feature_importance.iterrows():
+            bar_len = int(row["mean_abs_shap"] * 50)  # Simple visual bar
+            bar = "█" * bar_len
+            logger.info(f"  {row['feature']:30s} {row['mean_abs_shap']:.4f} {bar}")
+
 
