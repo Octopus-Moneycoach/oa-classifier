@@ -385,31 +385,10 @@ class TrainModelPipeline(Pipeline):
         
         # Compute SHAP values
         shap_values = explainer.shap_values(X_test)
-        
-        # Log shape to understand the structure
-        logger.info(f"Type of shap_values: {type(shap_values)}")
-        logger.info(f"Shape: {shap_values.shape}")
-        logger.info(f"X_test shape: {X_test.shape}")
-        logger.info(f"Expected value (base rate): {explainer.expected_value}")
-        sample_idx = 0
-        sample_shap = shap_values[sample_idx]
-        sample_features = X_test.iloc[sample_idx]
-        
-        logger.info(f"\n--- Sample {sample_idx} SHAP breakdown ---")
-        for feat, shap_val, feat_val in zip(X_test.columns, sample_shap, sample_features):
-            direction = "↑" if shap_val > 0 else "↓" if shap_val < 0 else "–"
-            logger.info(f"  {feat}: {shap_val:+.4f} {direction} (value={feat_val:.2f})")
-        
-        # Verify additivity: base + sum(shap) = raw prediction
-        shap_sum = sample_shap.sum()
-        raw_prediction = explainer.expected_value + shap_sum
-        logger.info(f"\nBase value: {explainer.expected_value:.4f}")
-        logger.info(f"Sum of SHAP: {shap_sum:+.4f}")
-        logger.info(f"Raw prediction (log-odds): {raw_prediction:.4f}")
-        
-        # Convert to probability
-        probability = 1 / (1 + np.exp(-raw_prediction))
-        logger.info(f"Probability (class 1): {probability:.4f}")
+
+        # Log base rate for reference
+        base_prob = 1 / (1 + np.exp(-explainer.expected_value))
+        logger.info(f"SHAP base probability: {base_prob:.1%}")
 
         # Mean |SHAP| = average impact magnitude across all samples
         mean_abs_shap = np.abs(shap_values).mean(axis=0)
@@ -420,69 +399,59 @@ class TrainModelPipeline(Pipeline):
             "mean_abs_shap": mean_abs_shap
         }).sort_values("mean_abs_shap", ascending=False)
         
-        logger.info("\n--- Global Feature Importance (mean |SHAP|) ---")
-        for _, row in feature_importance.iterrows():
-            bar_len = int(row["mean_abs_shap"] * 50)  # Simple visual bar
-            bar = "█" * bar_len
-            logger.info(f"  {row['feature']:30s} {row['mean_abs_shap']:.4f} {bar}")
+        # Log top 3 features
+        top3 = feature_importance.head(3)["feature"].tolist()
+        logger.info(f"Top SHAP features: {', '.join(top3)}")
         
         plots_dir = Path(os.getenv("LOCAL_PLOTS_PATH", "outputs/plots"))
         shap_dir = plots_dir / "shap"
         shap_dir.mkdir(parents=True, exist_ok=True)
         
+        # Save feature importance CSV
         csv_path = shap_dir / "shap_feature_importance.csv"
         feature_importance.to_csv(csv_path, index=False)
-        logger.info(f"SHAP feature importance saved to {csv_path}")
-        
-        # Log to MLflow for experiment tracking
         mlflow.log_artifact(str(csv_path), artifact_path="shap")
-        
-        # Bar plot (mean |SHAP| visualization) 
+
+        # Bar plot
         plt.figure()
         shap.summary_plot(shap_values, X_test, plot_type="bar", show=False)
         bar_path = shap_dir / "shap_bar.png"
         plt.savefig(bar_path, bbox_inches="tight", dpi=150)
         plt.close()
-        logger.info(f"SHAP bar plot saved to {bar_path}")
         mlflow.log_artifact(str(bar_path), artifact_path="shap")
-        
-        # Beeswarm plot (shows feature value → SHAP relationship)
+
+        # Beeswarm plot
         plt.figure()
-        shap.summary_plot(shap_values, X_test, show=False)  # default is beeswarm
+        shap.summary_plot(shap_values, X_test, show=False)
         summary_path = shap_dir / "shap_beeswarm.png"
         plt.savefig(summary_path, bbox_inches="tight", dpi=150)
         plt.close()
-        logger.info(f"SHAP beeswarm plot saved to {summary_path}")
         mlflow.log_artifact(str(summary_path), artifact_path="shap")
         
-        # Waterfall plot for individual explanation ===
-        # Create Explanation object (required for waterfall)
+        # Waterfall plots for low, mid, high predictions
         explanation = shap.Explanation(
             values=shap_values,
             base_values=explainer.expected_value,
             data=X_test.values,
             feature_names=X_test.columns.tolist(),
         )
-        
-                # Waterfall plots for low, mid, high predictions
+
         if hasattr(self.model, "predict_proba"):
             proba = self.model.predict_proba(X_test)[:, 1]
-            
             samples = {
                 "low": int(np.argmin(proba)),
                 "mid": int(np.argsort(proba)[len(proba) // 2]),
                 "high": int(np.argmax(proba)),
             }
-            
+
             for label, idx in samples.items():
                 plt.figure()
                 shap.waterfall_plot(explanation[idx], show=False)
                 waterfall_path = shap_dir / f"shap_waterfall_{label}.png"
                 plt.savefig(waterfall_path, bbox_inches="tight", dpi=150)
                 plt.close()
-                
-                pred_prob = proba[idx]
-                logger.info(f"SHAP waterfall ({label}, p={pred_prob:.3f}) saved to {waterfall_path}")
                 mlflow.log_artifact(str(waterfall_path), artifact_path="shap")
+
+        logger.info("SHAP analysis complete. Artifacts logged to MLflow.")
 
 
