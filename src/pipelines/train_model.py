@@ -428,16 +428,19 @@ class TrainModelPipeline(Pipeline):
         plt.close()
         mlflow.log_artifact(str(summary_path), artifact_path="shap")
 
-        # Dependence (scatter) plots for top features
+        # Create Explanation object for modern SHAP API
+        explanation = shap.Explanation(
+            values=shap_values,
+            base_values=explainer.expected_value,
+            data=X_test.values,
+            feature_names=X_test.columns.tolist(),
+        )
+
+        # Scatter plots for top features (modern API with auto interaction coloring)
         top_features = feature_importance.head(3)["feature"].tolist()
         for feat in top_features:
             plt.figure()
-            shap.dependence_plot(
-                feat,
-                shap_values,
-                X_test,
-                show=False,
-            )
+            shap.plots.scatter(explanation[:, feat], show=False)
             scatter_path = shap_dir / f"shap_scatter_{feat.lower()}.png"
             plt.savefig(scatter_path, bbox_inches="tight", dpi=150)
             plt.close()
@@ -494,13 +497,6 @@ class TrainModelPipeline(Pipeline):
             logger.info("SHAP cohort analysis saved.")
 
         # Waterfall plots for low, mid, high predictions
-        explanation = shap.Explanation(
-            values=shap_values,
-            base_values=explainer.expected_value,
-            data=X_test.values,
-            feature_names=X_test.columns.tolist(),
-        )
-
         if hasattr(self.model, "predict_proba"):
             proba = self.model.predict_proba(X_test)[:, 1]
             samples = {
