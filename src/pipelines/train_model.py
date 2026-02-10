@@ -435,11 +435,11 @@ class TrainModelPipeline(Pipeline):
             feature_names=X_test.columns.tolist(),
         )
 
-        # Scatter plots for top features (modern API with auto interaction coloring)
-        top_features = feature_importance.head(3)["feature"].tolist()
-        for feat in top_features:
+        # Scatter plots for top features with interaction coloring
+        for feat in top3:
             plt.figure()
-            shap.plots.scatter(explanation[:, feat], show=False)
+            # Auto-detect best interaction feature for color scale
+            shap.plots.scatter(explanation[:, feat], color=explanation, show=False)
             scatter_path = shap_dir / f"shap_scatter_{feat.lower()}.png"
             plt.savefig(scatter_path, bbox_inches="tight", dpi=150)
             plt.close()
@@ -452,23 +452,22 @@ class TrainModelPipeline(Pipeline):
             # Split into buckets
             bucket_labels = pd.qcut(proba, q=3, labels=["low", "mid", "high"])
 
-            # Calculate mean SHAP (directional) per bucket
+            # Create DataFrame with bucket labels for cohort grouping
             shap_df = pd.DataFrame(
                 shap_values, columns=X_test.columns, index=X_test.index
             )
             shap_df["bucket"] = np.array(bucket_labels, dtype=str)
 
+            # Signed SHAP cohort analysis (shows direction: +/-)
             cohort_shap = shap_df.groupby("bucket", observed=True).mean().T
             cohort_shap.index.name = "feature"
             cohort_shap = cohort_shap.reset_index()
 
-            # Reorder columns (only include those that exist)
             cols = ["feature"] + [
                 c for c in ["low", "mid", "high"] if c in cohort_shap.columns
             ]
             cohort_shap = cohort_shap[cols]
 
-            # Sort by absolute difference between high and low
             if "high" in cohort_shap.columns and "low" in cohort_shap.columns:
                 cohort_shap["spread"] = cohort_shap["high"] - cohort_shap["low"]
                 cohort_shap = cohort_shap.sort_values("spread", ascending=False)
@@ -478,12 +477,56 @@ class TrainModelPipeline(Pipeline):
             cohort_shap.to_csv(cohort_path, index=False)
             mlflow.log_artifact(str(cohort_path), artifact_path="shap")
 
-            # SHAP grouped bar plot by cohort
-            cohort_explanations = {}
+            # Absolute SHAP cohort analysis (magnitude regardless of direction)
+            shap_abs_df = pd.DataFrame(
+                np.abs(shap_values), columns=X_test.columns, index=X_test.index
+            )
+            shap_abs_df["bucket"] = np.array(bucket_labels, dtype=str)
+
+            cohort_abs_shap = shap_abs_df.groupby("bucket", observed=True).mean().T
+            cohort_abs_shap.index.name = "feature"
+            cohort_abs_shap = cohort_abs_shap.reset_index()
+
+            cols_abs = ["feature"] + [
+                c for c in ["low", "mid", "high"] if c in cohort_abs_shap.columns
+            ]
+            cohort_abs_shap = cohort_abs_shap[cols_abs]
+
+            # Sort by highest absolute impact in "high" bucket
+            if "high" in cohort_abs_shap.columns:
+                cohort_abs_shap = cohort_abs_shap.sort_values("high", ascending=False)
+
+            cohort_abs_path = shap_dir / "shap_cohort_abs_analysis.csv"
+            cohort_abs_shap.to_csv(cohort_abs_path, index=False)
+            mlflow.log_artifact(str(cohort_abs_path), artifact_path="shap")
+
+            # SHAP grouped bar plot by cohort - signed (direction)
+            cohort_signed_explanations = {}
             for bucket_name in ["Low", "Mid", "High"]:
                 mask = shap_df["bucket"] == bucket_name.lower()
                 bucket_shap = shap_values[mask.values]
-                cohort_explanations[bucket_name] = shap.Explanation(
+                # Use mean to get single signed value per feature
+                mean_bucket_shap = bucket_shap.mean(axis=0)
+                cohort_signed_explanations[bucket_name] = shap.Explanation(
+                    values=mean_bucket_shap,
+                    base_values=explainer.expected_value,
+                    data=X_test[mask].mean().values,
+                    feature_names=X_test.columns.tolist(),
+                )
+
+            plt.figure()
+            shap.plots.bar(cohort_signed_explanations, show=False)
+            cohort_chart_path = shap_dir / "shap_cohort_chart.png"
+            plt.savefig(cohort_chart_path, bbox_inches="tight", dpi=150)
+            plt.close()
+            mlflow.log_artifact(str(cohort_chart_path), artifact_path="shap")
+
+            # SHAP grouped bar plot by cohort - absolute (magnitude)
+            cohort_abs_explanations = {}
+            for bucket_name in ["Low", "Mid", "High"]:
+                mask = shap_df["bucket"] == bucket_name.lower()
+                bucket_shap = shap_values[mask.values]
+                cohort_abs_explanations[bucket_name] = shap.Explanation(
                     values=bucket_shap,
                     base_values=explainer.expected_value,
                     data=X_test[mask].values,
@@ -491,11 +534,11 @@ class TrainModelPipeline(Pipeline):
                 )
 
             plt.figure()
-            shap.plots.bar(cohort_explanations, show=False)
-            cohort_chart_path = shap_dir / "shap_cohort_chart.png"
-            plt.savefig(cohort_chart_path, bbox_inches="tight", dpi=150)
+            shap.plots.bar(cohort_abs_explanations, show=False)
+            cohort_abs_chart_path = shap_dir / "shap_cohort_abs_chart.png"
+            plt.savefig(cohort_abs_chart_path, bbox_inches="tight", dpi=150)
             plt.close()
-            mlflow.log_artifact(str(cohort_chart_path), artifact_path="shap")
+            mlflow.log_artifact(str(cohort_abs_chart_path), artifact_path="shap")
 
             logger.info("SHAP cohort analysis saved.")
 
