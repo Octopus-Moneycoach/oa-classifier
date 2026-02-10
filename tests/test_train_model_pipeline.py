@@ -50,6 +50,7 @@ def test_pipeline_run(pipeline, data):
         patch("mlflow.log_artifact"),
         patch("src.pipelines.train_model.read_data", return_value=data),
         patch("src.pipelines.train_model.write_data") as mock_write,
+        patch.object(pipeline, "_log_shap_analysis"),  # SHAP needs realistic data
     ):
         pipeline.run()
         assert pipeline.model is not None

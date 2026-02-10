@@ -120,7 +120,7 @@ class TrainModelPipeline(Pipeline):
 
             # ROC on the test set
             self._log_roc_curve(X_test, y_test)
-            
+
             # SHAP analysis
             self._log_shap_analysis(X_test)
 
@@ -371,18 +371,18 @@ class TrainModelPipeline(Pipeline):
         mlflow.log_artifact(str(roc_path), artifact_path=roc_path.parent.name)
 
         logger.info("ROC curve saved locally to %s and logged to MLflow.", roc_path)
-        
+
     def _log_shap_analysis(self, X_test: pd.DataFrame) -> None:
         """Generate SHAP explainability artifacts and log to MLflow."""
         logger.info("Starting SHAP analysis.")
-        
+
         if self.model is None:
             logger.warning("Model not available; skipping SHAP analysis.")
             return
 
         # TreeExplainer: exact SHAP for tree models (XGBoost, RF, LightGBM)
         explainer = shap.TreeExplainer(self.model)
-        
+
         # Compute SHAP values
         shap_values = explainer.shap_values(X_test)
 
@@ -392,21 +392,20 @@ class TrainModelPipeline(Pipeline):
 
         # Mean |SHAP| = average impact magnitude across all samples
         mean_abs_shap = np.abs(shap_values).mean(axis=0)
-        
+
         # Create sorted DataFrame
-        feature_importance = pd.DataFrame({
-            "feature": X_test.columns,
-            "mean_abs_shap": mean_abs_shap
-        }).sort_values("mean_abs_shap", ascending=False)
-        
+        feature_importance = pd.DataFrame(
+            {"feature": X_test.columns, "mean_abs_shap": mean_abs_shap}
+        ).sort_values("mean_abs_shap", ascending=False)
+
         # Log top 3 features
         top3 = feature_importance.head(3)["feature"].tolist()
         logger.info(f"Top SHAP features: {', '.join(top3)}")
-        
+
         plots_dir = Path(os.getenv("LOCAL_PLOTS_PATH", "outputs/plots"))
         shap_dir = plots_dir / "shap"
         shap_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Save feature importance CSV
         csv_path = shap_dir / "shap_feature_importance.csv"
         feature_importance.to_csv(csv_path, index=False)
@@ -454,7 +453,9 @@ class TrainModelPipeline(Pipeline):
             bucket_labels = pd.qcut(proba, q=3, labels=["low", "mid", "high"])
 
             # Calculate mean SHAP (directional) per bucket
-            shap_df = pd.DataFrame(shap_values, columns=X_test.columns, index=X_test.index)
+            shap_df = pd.DataFrame(
+                shap_values, columns=X_test.columns, index=X_test.index
+            )
             shap_df["bucket"] = np.array(bucket_labels, dtype=str)
 
             cohort_shap = shap_df.groupby("bucket", observed=True).mean().T
@@ -462,7 +463,9 @@ class TrainModelPipeline(Pipeline):
             cohort_shap = cohort_shap.reset_index()
 
             # Reorder columns (only include those that exist)
-            cols = ["feature"] + [c for c in ["low", "mid", "high"] if c in cohort_shap.columns]
+            cols = ["feature"] + [
+                c for c in ["low", "mid", "high"] if c in cohort_shap.columns
+            ]
             cohort_shap = cohort_shap[cols]
 
             # Sort by absolute difference between high and low
@@ -514,5 +517,3 @@ class TrainModelPipeline(Pipeline):
                 mlflow.log_artifact(str(waterfall_path), artifact_path="shap")
 
         logger.info("SHAP analysis complete. Artifacts logged to MLflow.")
-
-
