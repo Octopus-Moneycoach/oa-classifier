@@ -373,7 +373,7 @@ class TrainModelPipeline(Pipeline):
         logger.info("ROC curve saved locally to %s and logged to MLflow.", roc_path)
         
     def _log_shap_analysis(self, X_test: pd.DataFrame) -> None:
-        """Calculate SHAP values and log their shape."""
+        """Generate SHAP explainability artifacts and log to MLflow."""
         logger.info("Starting SHAP analysis.")
         
         if self.model is None:
