@@ -38,6 +38,8 @@ logger = logging.getLogger(__name__)
 class TrainModelPipeline(Pipeline):
     """End-to-end training pipeline."""
 
+    BUCKETS = ["Low", "Medium", "High"]
+
     def __init__(self, run_name: Optional[str] = None) -> None:
         """Initialise configuration and placeholders.
 
@@ -205,21 +207,21 @@ class TrainModelPipeline(Pipeline):
         """Bin prediction scores into Low/Medium/High with safe fallbacks."""
         scores = pd.Series(scores, index=scores.index)
         unique_count = scores.nunique(dropna=True)
+        low, med, high = self.BUCKETS
         if unique_count <= 1:
-            return pd.Series(["Medium"] * len(scores), index=scores.index)
+            return pd.Series([med] * len(scores), index=scores.index)
         try:
             cats = pd.qcut(scores, q=3, duplicates="drop")
             n_bins = len(cats.cat.categories)
             if n_bins == 1:
-                labels = ["Medium"]
+                labels = [med]
             elif n_bins == 2:
-                labels = ["Low", "High"]
+                labels = [low, high]
             else:
-                labels = ["Low", "Medium", "High"]
+                labels = self.BUCKETS
             return pd.qcut(scores, q=3, labels=labels, duplicates="drop")
         except ValueError:
-            labels = ["Low", "High"]
-            return pd.cut(scores, bins=2, labels=labels, include_lowest=True)
+            return pd.cut(scores, bins=2, labels=[low, high], include_lowest=True)
 
     def resample(
         self, X_train: pd.DataFrame, y_train: pd.Series
@@ -374,6 +376,7 @@ class TrainModelPipeline(Pipeline):
 
     def _log_shap_analysis(self, X_test: pd.DataFrame) -> None:
         """Generate SHAP explainability artifacts and log to MLflow."""
+        max_display = 15  # Max features to show in plots
         logger.info("Starting SHAP analysis.")
 
         if self.model is None:
@@ -381,7 +384,11 @@ class TrainModelPipeline(Pipeline):
             return
 
         # TreeExplainer: exact SHAP for tree models (XGBoost, RF, LightGBM)
-        explainer = shap.TreeExplainer(self.model)
+        try:
+            explainer = shap.TreeExplainer(self.model)
+        except Exception as e:
+            logger.warning("SHAP analysis skipped (unsupported model type): %s", e)
+            return
 
         # Compute SHAP values
         shap_values = explainer.shap_values(X_test)
@@ -421,7 +428,7 @@ class TrainModelPipeline(Pipeline):
 
         # Beeswarm plot
         plt.figure()
-        shap.summary_plot(shap_values, X_test, show=False)
+        shap.summary_plot(shap_values, X_test, max_display=max_display, show=False)
         summary_path = shap_dir / "shap_beeswarm.png"
         plt.savefig(summary_path, bbox_inches="tight", dpi=150)
         plt.close()
@@ -440,7 +447,8 @@ class TrainModelPipeline(Pipeline):
             plt.figure()
             # Auto-detect best interaction feature for color scale
             shap.plots.scatter(explanation[:, feat], color=explanation, show=False)
-            scatter_path = shap_dir / f"shap_scatter_{feat.lower()}.png"
+            safe_name = feat.lower().replace("/", "_").replace(" ", "_")
+            scatter_path = shap_dir / f"shap_scatter_{safe_name}.png"
             plt.savefig(scatter_path, bbox_inches="tight", dpi=150)
             plt.close()
             mlflow.log_artifact(str(scatter_path), artifact_path="shap")
@@ -448,9 +456,13 @@ class TrainModelPipeline(Pipeline):
         # Cohort analysis: mean SHAP per prediction bucket
         if hasattr(self.model, "predict_proba"):
             proba = self.model.predict_proba(X_test)[:, 1]
+            low, med, high = self.BUCKETS
 
             # Split into buckets
-            bucket_labels = pd.qcut(proba, q=3, labels=["low", "mid", "high"])
+            bucket_labels = pd.qcut(
+                proba, q=3, labels=self.BUCKETS, duplicates="drop"
+            )
+            logger.info(f"Cohort sizes: {bucket_labels.value_counts().to_dict()}")
 
             # Create DataFrame with bucket labels for cohort grouping
             shap_df = pd.DataFrame(
@@ -469,13 +481,13 @@ class TrainModelPipeline(Pipeline):
             cohort_abs_shap = cohort_abs_shap.reset_index()
 
             cols_abs = ["feature"] + [
-                c for c in ["low", "mid", "high"] if c in cohort_abs_shap.columns
+                c for c in self.BUCKETS if c in cohort_abs_shap.columns
             ]
             cohort_abs_shap = cohort_abs_shap[cols_abs]
 
-            # Sort by highest absolute impact in "high" bucket
-            if "high" in cohort_abs_shap.columns:
-                cohort_abs_shap = cohort_abs_shap.sort_values("high", ascending=False)
+            # Sort by highest absolute impact in "High" bucket
+            if high in cohort_abs_shap.columns:
+                cohort_abs_shap = cohort_abs_shap.sort_values(high, ascending=False)
 
             cohort_abs_path = shap_dir / "shap_cohort_abs_analysis.csv"
             cohort_abs_shap.to_csv(cohort_abs_path, index=False)
@@ -483,8 +495,8 @@ class TrainModelPipeline(Pipeline):
 
             # SHAP grouped bar plot by cohort - absolute (magnitude)
             cohort_abs_explanations = {}
-            for bucket_name in ["Low", "Mid", "High"]:
-                mask = shap_df["bucket"] == bucket_name.lower()
+            for bucket_name in self.BUCKETS:
+                mask = shap_df["bucket"] == bucket_name
                 bucket_shap = shap_values[mask.values]
                 cohort_abs_explanations[bucket_name] = shap.Explanation(
                     values=bucket_shap,
@@ -501,7 +513,7 @@ class TrainModelPipeline(Pipeline):
             mlflow.log_artifact(str(cohort_abs_chart_path), artifact_path="shap")
 
             # Beeswarm plots per cohort (shows direction + distribution)
-            for bucket_name in ["low", "mid", "high"]:
+            for bucket_name in self.BUCKETS:
                 mask = shap_df["bucket"] == bucket_name
                 cohort_explanation = shap.Explanation(
                     values=shap_values[mask.values],
@@ -510,29 +522,28 @@ class TrainModelPipeline(Pipeline):
                     feature_names=X_test.columns.tolist(),
                 )
                 plt.figure(figsize=(10, 8))
-                shap.plots.beeswarm(cohort_explanation, max_display=15, show=False)
-                beeswarm_path = shap_dir / f"shap_beeswarm_{bucket_name}.png"
+                shap.plots.beeswarm(cohort_explanation, max_display=max_display, show=False)
+                beeswarm_path = shap_dir / f"shap_beeswarm_{bucket_name.lower()}.png"
                 plt.savefig(beeswarm_path, bbox_inches="tight", dpi=150)
                 plt.close()
                 mlflow.log_artifact(str(beeswarm_path), artifact_path="shap")
 
             logger.info("SHAP cohort analysis saved.")
 
-        # Waterfall plots for low, mid, high predictions
-        if hasattr(self.model, "predict_proba"):
-            proba = self.model.predict_proba(X_test)[:, 1]
+            # Waterfall plots for low, medium, high predictions
             samples = {
-                "low": int(np.argmin(proba)),
-                "mid": int(np.argsort(proba)[len(proba) // 2]),
-                "high": int(np.argmax(proba)),
+                low: int(np.argmin(proba)),
+                med: int(np.argsort(proba)[len(proba) // 2]),
+                high: int(np.argmax(proba)),
             }
 
             for label, idx in samples.items():
                 plt.figure()
-                shap.waterfall_plot(explanation[idx], show=False)
-                waterfall_path = shap_dir / f"shap_waterfall_{label}.png"
+                shap.plots.waterfall(explanation[idx], show=False)
+                waterfall_path = shap_dir / f"shap_waterfall_{label.lower()}.png"
                 plt.savefig(waterfall_path, bbox_inches="tight", dpi=150)
                 plt.close()
                 mlflow.log_artifact(str(waterfall_path), artifact_path="shap")
 
+        plt.close("all")  # Ensure no figures remain open
         logger.info("SHAP analysis complete. Artifacts logged to MLflow.")
