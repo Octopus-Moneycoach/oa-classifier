@@ -376,7 +376,7 @@ class TrainModelPipeline(Pipeline):
 
     def _log_shap_analysis(self, X_test: pd.DataFrame) -> None:
         """Generate SHAP explainability artifacts and log to MLflow."""
-        max_display = 15  # Max features to show in plots
+        max_display = 15
         logger.info("Starting SHAP analysis.")
 
         if self.model is None:
@@ -418,22 +418,6 @@ class TrainModelPipeline(Pipeline):
         feature_importance.to_csv(csv_path, index=False)
         mlflow.log_artifact(str(csv_path), artifact_path="shap")
 
-        # Bar plot
-        plt.figure()
-        shap.summary_plot(shap_values, X_test, plot_type="bar", show=False)
-        bar_path = shap_dir / "shap_bar.png"
-        plt.savefig(bar_path, bbox_inches="tight", dpi=150)
-        plt.close()
-        mlflow.log_artifact(str(bar_path), artifact_path="shap")
-
-        # Beeswarm plot
-        plt.figure()
-        shap.summary_plot(shap_values, X_test, max_display=max_display, show=False)
-        summary_path = shap_dir / "shap_beeswarm.png"
-        plt.savefig(summary_path, bbox_inches="tight", dpi=150)
-        plt.close()
-        mlflow.log_artifact(str(summary_path), artifact_path="shap")
-
         # Create Explanation object for modern SHAP API
         explanation = shap.Explanation(
             values=shap_values,
@@ -442,108 +426,172 @@ class TrainModelPipeline(Pipeline):
             feature_names=X_test.columns.tolist(),
         )
 
-        # Scatter plots for top features with interaction coloring
-        for feat in top3:
-            plt.figure()
-            # Auto-detect best interaction feature for color scale
-            shap.plots.scatter(explanation[:, feat], color=explanation, show=False)
+        self._log_shap_bar(shap_values, X_test, shap_dir)
+        self._log_shap_beeswarm(shap_values, X_test, shap_dir, max_display)
+        self._log_shap_scatter(explanation, top3, shap_dir)
+        self._log_shap_cohort(
+            shap_values, X_test, explainer.expected_value, shap_dir, max_display
+        )
+        self._log_shap_waterfall(explanation, X_test, shap_dir)
+
+        plt.close("all")
+        logger.info("SHAP analysis complete. Artifacts logged to MLflow.")
+
+    def _log_shap_bar(
+        self,
+        shap_values: np.ndarray,
+        X_test: pd.DataFrame,
+        shap_dir: Path,
+    ) -> None:
+        """Generate and log SHAP bar plot."""
+        plt.figure()
+        shap.summary_plot(shap_values, X_test, plot_type="bar", show=False)
+        bar_path = shap_dir / "shap_bar.png"
+        plt.savefig(bar_path, bbox_inches="tight", dpi=150)
+        plt.close()
+        mlflow.log_artifact(str(bar_path), artifact_path="shap")
+
+    def _log_shap_beeswarm(
+        self,
+        shap_values: np.ndarray,
+        X_test: pd.DataFrame,
+        shap_dir: Path,
+        max_display: int,
+    ) -> None:
+        """Generate and log SHAP beeswarm plot."""
+        plt.figure()
+        shap.summary_plot(shap_values, X_test, max_display=max_display, show=False)
+        summary_path = shap_dir / "shap_beeswarm.png"
+        plt.savefig(summary_path, bbox_inches="tight", dpi=150)
+        plt.close()
+        mlflow.log_artifact(str(summary_path), artifact_path="shap")
+
+    def _log_shap_scatter(
+        self,
+        explanation: shap.Explanation,
+        features: list[str],
+        shap_dir: Path,
+    ) -> None:
+        """Generate and log SHAP scatter plots for given features."""
+        for feat in features:
             safe_name = feat.lower().replace("/", "_").replace(" ", "_")
+            plt.figure()
+            shap.plots.scatter(explanation[:, feat], color=explanation, show=False)
             scatter_path = shap_dir / f"shap_scatter_{safe_name}.png"
             plt.savefig(scatter_path, bbox_inches="tight", dpi=150)
             plt.close()
             mlflow.log_artifact(str(scatter_path), artifact_path="shap")
 
-        # Cohort analysis: mean SHAP per prediction bucket
-        if hasattr(self.model, "predict_proba"):
-            proba = self.model.predict_proba(X_test)[:, 1]
-            low, med, high = self.BUCKETS
+    def _log_shap_cohort(
+        self,
+        shap_values: np.ndarray,
+        X_test: pd.DataFrame,
+        expected_value: float,
+        shap_dir: Path,
+        max_display: int,
+    ) -> None:
+        """Generate and log SHAP cohort analysis artifacts."""
+        if not hasattr(self.model, "predict_proba"):
+            return
 
-            # Split into buckets
-            bucket_labels = pd.qcut(proba, q=3, labels=self.BUCKETS, duplicates="drop")
-            logger.info(f"Cohort sizes: {bucket_labels.value_counts().to_dict()}")
+        proba = self.model.predict_proba(X_test)[:, 1]
+        high = self.BUCKETS[-1]
 
-            # Create DataFrame with bucket labels for cohort grouping
-            shap_df = pd.DataFrame(
-                shap_values, columns=X_test.columns, index=X_test.index
+        # Split into buckets
+        bucket_labels = pd.qcut(proba, q=3, labels=self.BUCKETS, duplicates="drop")
+        logger.info(f"Cohort sizes: {bucket_labels.value_counts().to_dict()}")
+
+        # Create DataFrame with bucket labels for cohort grouping
+        shap_df = pd.DataFrame(
+            shap_values, columns=X_test.columns, index=X_test.index
+        )
+        shap_df["bucket"] = np.array(bucket_labels, dtype=str)
+
+        # Absolute SHAP cohort analysis (magnitude regardless of direction)
+        shap_abs_df = pd.DataFrame(
+            np.abs(shap_values), columns=X_test.columns, index=X_test.index
+        )
+        shap_abs_df["bucket"] = np.array(bucket_labels, dtype=str)
+
+        cohort_abs_shap = shap_abs_df.groupby("bucket", observed=True).mean().T
+        cohort_abs_shap.index.name = "feature"
+        cohort_abs_shap = cohort_abs_shap.reset_index()
+
+        cols_abs = ["feature"] + [
+            c for c in self.BUCKETS if c in cohort_abs_shap.columns
+        ]
+        cohort_abs_shap = cohort_abs_shap[cols_abs]
+
+        # Sort by highest absolute impact in "High" bucket
+        if high in cohort_abs_shap.columns:
+            cohort_abs_shap = cohort_abs_shap.sort_values(high, ascending=False)
+
+        cohort_abs_path = shap_dir / "shap_cohort_abs_analysis.csv"
+        cohort_abs_shap.to_csv(cohort_abs_path, index=False)
+        mlflow.log_artifact(str(cohort_abs_path), artifact_path="shap")
+
+        # SHAP grouped bar plot by cohort - absolute (magnitude)
+        cohort_abs_explanations = {}
+        for bucket_name in self.BUCKETS:
+            mask = shap_df["bucket"] == bucket_name
+            bucket_shap = shap_values[mask.values]
+            cohort_abs_explanations[bucket_name] = shap.Explanation(
+                values=bucket_shap,
+                base_values=expected_value,
+                data=X_test[mask].values,
+                feature_names=X_test.columns.tolist(),
             )
-            shap_df["bucket"] = np.array(bucket_labels, dtype=str)
 
-            # Absolute SHAP cohort analysis (magnitude regardless of direction)
-            shap_abs_df = pd.DataFrame(
-                np.abs(shap_values), columns=X_test.columns, index=X_test.index
+        plt.figure()
+        shap.plots.bar(cohort_abs_explanations, show=False)
+        cohort_abs_chart_path = shap_dir / "shap_cohort_abs_chart.png"
+        plt.savefig(cohort_abs_chart_path, bbox_inches="tight", dpi=150)
+        plt.close()
+        mlflow.log_artifact(str(cohort_abs_chart_path), artifact_path="shap")
+
+        # Beeswarm plots per cohort (shows direction + distribution)
+        for bucket_name in self.BUCKETS:
+            mask = shap_df["bucket"] == bucket_name
+            cohort_explanation = shap.Explanation(
+                values=shap_values[mask.values],
+                base_values=expected_value,
+                data=X_test[mask].values,
+                feature_names=X_test.columns.tolist(),
             )
-            shap_abs_df["bucket"] = np.array(bucket_labels, dtype=str)
-
-            cohort_abs_shap = shap_abs_df.groupby("bucket", observed=True).mean().T
-            cohort_abs_shap.index.name = "feature"
-            cohort_abs_shap = cohort_abs_shap.reset_index()
-
-            cols_abs = ["feature"] + [
-                c for c in self.BUCKETS if c in cohort_abs_shap.columns
-            ]
-            cohort_abs_shap = cohort_abs_shap[cols_abs]
-
-            # Sort by highest absolute impact in "High" bucket
-            if high in cohort_abs_shap.columns:
-                cohort_abs_shap = cohort_abs_shap.sort_values(high, ascending=False)
-
-            cohort_abs_path = shap_dir / "shap_cohort_abs_analysis.csv"
-            cohort_abs_shap.to_csv(cohort_abs_path, index=False)
-            mlflow.log_artifact(str(cohort_abs_path), artifact_path="shap")
-
-            # SHAP grouped bar plot by cohort - absolute (magnitude)
-            cohort_abs_explanations = {}
-            for bucket_name in self.BUCKETS:
-                mask = shap_df["bucket"] == bucket_name
-                bucket_shap = shap_values[mask.values]
-                cohort_abs_explanations[bucket_name] = shap.Explanation(
-                    values=bucket_shap,
-                    base_values=explainer.expected_value,
-                    data=X_test[mask].values,
-                    feature_names=X_test.columns.tolist(),
-                )
-
-            plt.figure()
-            shap.plots.bar(cohort_abs_explanations, show=False)
-            cohort_abs_chart_path = shap_dir / "shap_cohort_abs_chart.png"
-            plt.savefig(cohort_abs_chart_path, bbox_inches="tight", dpi=150)
+            plt.figure(figsize=(10, 8))
+            shap.plots.beeswarm(
+                cohort_explanation, max_display=max_display, show=False
+            )
+            beeswarm_path = shap_dir / f"shap_beeswarm_{bucket_name.lower()}.png"
+            plt.savefig(beeswarm_path, bbox_inches="tight", dpi=150)
             plt.close()
-            mlflow.log_artifact(str(cohort_abs_chart_path), artifact_path="shap")
+            mlflow.log_artifact(str(beeswarm_path), artifact_path="shap")
 
-            # Beeswarm plots per cohort (shows direction + distribution)
-            for bucket_name in self.BUCKETS:
-                mask = shap_df["bucket"] == bucket_name
-                cohort_explanation = shap.Explanation(
-                    values=shap_values[mask.values],
-                    base_values=explainer.expected_value,
-                    data=X_test[mask].values,
-                    feature_names=X_test.columns.tolist(),
-                )
-                plt.figure(figsize=(10, 8))
-                shap.plots.beeswarm(
-                    cohort_explanation, max_display=max_display, show=False
-                )
-                beeswarm_path = shap_dir / f"shap_beeswarm_{bucket_name.lower()}.png"
-                plt.savefig(beeswarm_path, bbox_inches="tight", dpi=150)
-                plt.close()
-                mlflow.log_artifact(str(beeswarm_path), artifact_path="shap")
+        logger.info("SHAP cohort analysis saved.")
 
-            logger.info("SHAP cohort analysis saved.")
+    def _log_shap_waterfall(
+        self,
+        explanation: shap.Explanation,
+        X_test: pd.DataFrame,
+        shap_dir: Path,
+    ) -> None:
+        """Generate and log SHAP waterfall plots for representative samples."""
+        if not hasattr(self.model, "predict_proba"):
+            return
 
-            # Waterfall plots for low, medium, high predictions
-            samples = {
-                low: int(np.argmin(proba)),
-                med: int(np.argsort(proba)[len(proba) // 2]),
-                high: int(np.argmax(proba)),
-            }
+        proba = self.model.predict_proba(X_test)[:, 1]
+        low, med, high = self.BUCKETS
 
-            for label, idx in samples.items():
-                plt.figure()
-                shap.plots.waterfall(explanation[idx], show=False)
-                waterfall_path = shap_dir / f"shap_waterfall_{label.lower()}.png"
-                plt.savefig(waterfall_path, bbox_inches="tight", dpi=150)
-                plt.close()
-                mlflow.log_artifact(str(waterfall_path), artifact_path="shap")
+        samples = {
+            low: int(np.argmin(proba)),
+            med: int(np.argsort(proba)[len(proba) // 2]),
+            high: int(np.argmax(proba)),
+        }
 
-        plt.close("all")  # Ensure no figures remain open
-        logger.info("SHAP analysis complete. Artifacts logged to MLflow.")
+        for label, idx in samples.items():
+            plt.figure()
+            shap.plots.waterfall(explanation[idx], show=False)
+            waterfall_path = shap_dir / f"shap_waterfall_{label.lower()}.png"
+            plt.savefig(waterfall_path, bbox_inches="tight", dpi=150)
+            plt.close()
+            mlflow.log_artifact(str(waterfall_path), artifact_path="shap")
