@@ -124,7 +124,7 @@ class TrainModelPipeline(Pipeline):
             self._log_roc_curve(X_test, y_test)
 
             # SHAP analysis
-            self._log_shap_analysis(X_test)
+            self._log_shap_analysis(X_test, y_test)
 
             # Log model
             if self.model is not None:
@@ -429,7 +429,51 @@ class TrainModelPipeline(Pipeline):
             predict_fn = model.predict
         return shap.Explainer(predict_fn, X_background)
 
-    def _log_shap_analysis(self, X_test: pd.DataFrame) -> None:
+    @staticmethod
+    def _normalize_shap_explanation(
+        sv: object,
+        explainer: shap.Explainer,
+        X_test: pd.DataFrame,
+    ) -> shap.Explanation:
+        """Normalize SHAP output into a consistent Explanation object.
+
+        Handles: shap.Explanation (modern API), list of arrays (older binary),
+        2D arrays, and 3D arrays (multiclass).
+        """
+        if isinstance(sv, shap.Explanation):
+            explanation = sv
+            if explanation.values.ndim == 3 and explanation.values.shape[-1] > 1:
+                base = np.asarray(explanation.base_values)
+                explanation = shap.Explanation(
+                    values=explanation.values[:, :, 1],
+                    base_values=base[:, 1] if base.ndim == 2 else base[1],
+                    data=explanation.data,
+                    feature_names=explanation.feature_names,
+                )
+            return explanation
+
+        # Older explainers return ndarray or list
+        shap_values = sv
+        expected_value = getattr(explainer, "expected_value", 0.0)
+
+        if isinstance(shap_values, list):
+            shap_values = shap_values[1]
+        elif hasattr(shap_values, "ndim") and shap_values.ndim == 3:
+            shap_values = shap_values[:, :, 1]
+
+        if isinstance(expected_value, (list, np.ndarray)):
+            ev = np.asarray(expected_value)
+            if ev.ndim > 0:
+                expected_value = ev[1]
+
+        return shap.Explanation(
+            values=shap_values,
+            base_values=expected_value,
+            data=X_test.values,
+            feature_names=X_test.columns.tolist(),
+        )
+
+    def _log_shap_analysis(self, X_test: pd.DataFrame, y_test: pd.Series) -> None:
         """Generate SHAP explainability artifacts and log to MLflow."""
         max_display = 15
         logger.info("Starting SHAP analysis.")
@@ -437,6 +481,15 @@ class TrainModelPipeline(Pipeline):
         if self.model is None:
             logger.warning("Model not available; skipping SHAP analysis.")
             return
+
+        # Cap sample size for SHAP to bound runtime and artifact size
+        shap_max_samples = int(self.config.get("shap_max_samples", 1000))
+        if len(X_test) > shap_max_samples:
+            logger.info(
+                f"Sampling {shap_max_samples}/{len(X_test)} rows for SHAP analysis."
+            )
+            X_test = X_test.sample(n=shap_max_samples, random_state=42)
+            y_test = y_test.loc[X_test.index]
 
         # Background sample for non-tree explainers
         bg_n = int(self.config.get("shap_background_samples", 200))
@@ -448,12 +501,16 @@ class TrainModelPipeline(Pipeline):
             logger.warning("SHAP analysis skipped (unsupported model type): %s", e)
             return
 
-        # Compute SHAP values
-        shap_values = explainer.shap_values(X_test)
+        # Compute SHAP values and normalize into a consistent Explanation
+        sv = explainer.shap_values(X_test)
+        explanation = self._normalize_shap_explanation(sv, explainer, X_test)
+        shap_values = explanation.values
+        expected_value = explanation.base_values
 
         # Log base rate for reference
-        base_prob = 1 / (1 + np.exp(-explainer.expected_value))
-        logger.info(f"SHAP base probability: {base_prob:.1%}")
+        if np.isscalar(expected_value):
+            base_prob = 1 / (1 + np.exp(-expected_value))
+            logger.info(f"SHAP base probability: {base_prob:.1%}")
 
         # Mean |SHAP| = average impact magnitude across all samples
         mean_abs_shap = np.abs(shap_values).mean(axis=0)
@@ -463,9 +520,9 @@ class TrainModelPipeline(Pipeline):
             {"feature": X_test.columns, "mean_abs_shap": mean_abs_shap}
         ).sort_values("mean_abs_shap", ascending=False)
 
-        # Log top 3 features
-        top3 = feature_importance.head(3)["feature"].tolist()
-        logger.info(f"Top SHAP features: {', '.join(top3)}")
+        # Top features shown in SHAP plots
+        top_features = feature_importance.head(max_display)["feature"].tolist()
+        logger.info(f"Top SHAP features: {', '.join(top_features[:3])}")
 
         plots_dir = Path(os.getenv("LOCAL_PLOTS_PATH", "outputs/plots"))
         shap_dir = plots_dir / "shap"
@@ -476,19 +533,11 @@ class TrainModelPipeline(Pipeline):
         feature_importance.to_csv(csv_path, index=False)
         mlflow.log_artifact(str(csv_path), artifact_path="shap")
 
-        # Create Explanation object for modern SHAP API
-        explanation = shap.Explanation(
-            values=shap_values,
-            base_values=explainer.expected_value,
-            data=X_test.values,
-            feature_names=X_test.columns.tolist(),
-        )
-
         self._log_shap_bar(shap_values, X_test, shap_dir)
         self._log_shap_beeswarm(shap_values, X_test, shap_dir, max_display)
-        self._log_shap_scatter(explanation, top3, shap_dir)
+        self._log_shap_scatter(explanation, top_features, y_test, shap_dir)
         self._log_shap_cohort(
-            shap_values, X_test, explainer.expected_value, shap_dir, max_display
+            shap_values, X_test, expected_value, shap_dir, max_display
         )
         self._log_shap_waterfall(explanation, X_test, shap_dir)
 
@@ -528,17 +577,32 @@ class TrainModelPipeline(Pipeline):
         self,
         explanation: shap.Explanation,
         features: list[str],
+        y_test: pd.Series,
         shap_dir: Path,
     ) -> None:
         """Generate and log SHAP scatter plots for given features."""
         for feat in features:
             safe_name = feat.lower().replace("/", "_").replace(" ", "_")
+
+            # Interaction-colored scatter (auto-detect best interaction feature)
             plt.figure()
             shap.plots.scatter(explanation[:, feat], color=explanation, show=False)
             scatter_path = shap_dir / f"shap_scatter_{safe_name}.png"
             plt.savefig(scatter_path, bbox_inches="tight", dpi=150)
             plt.close()
             mlflow.log_artifact(str(scatter_path), artifact_path="shap")
+
+            # Target-colored scatter (how SHAP values vary across classes)
+            plt.figure()
+            shap.plots.scatter(
+                explanation[:, feat],
+                color=y_test.values,
+                show=False,
+            )
+            target_path = shap_dir / f"shap_scatter_{safe_name}_by_target.png"
+            plt.savefig(target_path, bbox_inches="tight", dpi=150)
+            plt.close()
+            mlflow.log_artifact(str(target_path), artifact_path="shap")
 
     def _log_shap_cohort(
         self,
@@ -554,15 +618,23 @@ class TrainModelPipeline(Pipeline):
 
         proba = self.model.predict_proba(X_test)[:, 1]
         high = self.BUCKETS[-1]
+        low, med = self.BUCKETS[0], self.BUCKETS[1]
 
-        # Split into buckets
-        bucket_labels = pd.qcut(proba, q=3, labels=self.BUCKETS, duplicates="drop")
+        # Split into buckets — handle fewer bins when duplicates are dropped
+        bucket_labels = pd.qcut(pd.Series(proba), q=3, duplicates="drop")
+        n_bins = len(bucket_labels.cat.categories)
+        if n_bins == 1:
+            labels = [med]
+        elif n_bins == 2:
+            labels = [low, high]
+        else:
+            labels = self.BUCKETS
+        bucket_labels = pd.qcut(pd.Series(proba), q=3, labels=labels, duplicates="drop")
+        active_buckets = [b for b in labels if (bucket_labels == b).any()]
         logger.info(f"Cohort sizes: {bucket_labels.value_counts().to_dict()}")
 
         # Create DataFrame with bucket labels for cohort grouping
-        shap_df = pd.DataFrame(
-            shap_values, columns=X_test.columns, index=X_test.index
-        )
+        shap_df = pd.DataFrame(shap_values, columns=X_test.columns, index=X_test.index)
         shap_df["bucket"] = np.array(bucket_labels, dtype=str)
 
         # Absolute SHAP cohort analysis (magnitude regardless of direction)
@@ -576,7 +648,7 @@ class TrainModelPipeline(Pipeline):
         cohort_abs_shap = cohort_abs_shap.reset_index()
 
         cols_abs = ["feature"] + [
-            c for c in self.BUCKETS if c in cohort_abs_shap.columns
+            c for c in active_buckets if c in cohort_abs_shap.columns
         ]
         cohort_abs_shap = cohort_abs_shap[cols_abs]
 
@@ -590,7 +662,7 @@ class TrainModelPipeline(Pipeline):
 
         # SHAP grouped bar plot by cohort - absolute (magnitude)
         cohort_abs_explanations = {}
-        for bucket_name in self.BUCKETS:
+        for bucket_name in active_buckets:
             mask = shap_df["bucket"] == bucket_name
             bucket_shap = shap_values[mask.values]
             cohort_abs_explanations[bucket_name] = shap.Explanation(
@@ -608,7 +680,7 @@ class TrainModelPipeline(Pipeline):
         mlflow.log_artifact(str(cohort_abs_chart_path), artifact_path="shap")
 
         # Beeswarm plots per cohort (shows direction + distribution)
-        for bucket_name in self.BUCKETS:
+        for bucket_name in active_buckets:
             mask = shap_df["bucket"] == bucket_name
             cohort_explanation = shap.Explanation(
                 values=shap_values[mask.values],
@@ -617,9 +689,7 @@ class TrainModelPipeline(Pipeline):
                 feature_names=X_test.columns.tolist(),
             )
             plt.figure(figsize=(10, 8))
-            shap.plots.beeswarm(
-                cohort_explanation, max_display=max_display, show=False
-            )
+            shap.plots.beeswarm(cohort_explanation, max_display=max_display, show=False)
             beeswarm_path = shap_dir / f"shap_beeswarm_{bucket_name.lower()}.png"
             plt.savefig(beeswarm_path, bbox_inches="tight", dpi=150)
             plt.close()
