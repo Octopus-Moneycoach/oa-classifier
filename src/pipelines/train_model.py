@@ -458,7 +458,7 @@ class TrainModelPipeline(Pipeline):
 
         if isinstance(shap_values, list):
             shap_values = shap_values[1]
-        elif hasattr(shap_values, "ndim") and shap_values.ndim == 3:
+        elif isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
             shap_values = shap_values[:, :, 1]
 
         if isinstance(expected_value, (list, np.ndarray)):
@@ -508,7 +508,7 @@ class TrainModelPipeline(Pipeline):
         expected_value = explanation.base_values
 
         # Log base rate for reference
-        if np.isscalar(expected_value):
+        if np.isscalar(expected_value) and isinstance(expected_value, (int, float)):
             base_prob = 1 / (1 + np.exp(-expected_value))
             logger.info(f"SHAP base probability: {base_prob:.1%}")
 
@@ -613,7 +613,7 @@ class TrainModelPipeline(Pipeline):
         max_display: int,
     ) -> None:
         """Generate and log SHAP cohort analysis artifacts."""
-        if not hasattr(self.model, "predict_proba"):
+        if self.model is None or not hasattr(self.model, "predict_proba"):
             return
 
         proba = self.model.predict_proba(X_test)[:, 1]
@@ -704,7 +704,7 @@ class TrainModelPipeline(Pipeline):
         shap_dir: Path,
     ) -> None:
         """Generate and log SHAP waterfall plots for representative samples."""
-        if not hasattr(self.model, "predict_proba"):
+        if self.model is None or not hasattr(self.model, "predict_proba"):
             return
 
         proba = self.model.predict_proba(X_test)[:, 1]
