@@ -24,3 +24,6 @@ model_params:
 
 stratify: true
 test_size: 0.2
+
+# SHAP explainability settings
+shap_background_samples: 200 # background rows for Linear/Permutation explainers

@@ -374,6 +374,61 @@ class TrainModelPipeline(Pipeline):
 
         logger.info("ROC curve saved locally to %s and logged to MLflow.", roc_path)
 
+    @staticmethod
+    def _is_tree_model(model: BaseEstimator) -> bool:
+        """Check if model is a tree-based estimator."""
+        from sklearn.tree import DecisionTreeClassifier
+
+        return isinstance(
+            model,
+            (
+                xgb.XGBClassifier,
+                RandomForestClassifier,
+                DecisionTreeClassifier,
+            ),
+        )
+
+    @staticmethod
+    def _is_linear_model(model: BaseEstimator) -> bool:
+        """Check if model is a linear estimator."""
+        from sklearn.linear_model import SGDClassifier
+        from sklearn.svm import LinearSVC
+
+        return isinstance(
+            model,
+            (LogisticRegression, SGDClassifier, LinearSVC),
+        )
+
+    def _make_shap_explainer(
+        self, model: BaseEstimator, X_background: pd.DataFrame
+    ) -> shap.Explainer:
+        """Create the appropriate SHAP explainer for the model type.
+
+        Tree models → TreeExplainer (exact, fast).
+        Linear models → LinearExplainer (exact for linear).
+        Everything else → shap.Explainer (Permutation/Kernel fallback).
+        """
+        if self._is_tree_model(model):
+            logger.info("Using TreeExplainer for %s.", type(model).__name__)
+            return shap.TreeExplainer(model)
+
+        if self._is_linear_model(model):
+            logger.info("Using LinearExplainer for %s.", type(model).__name__)
+            return shap.LinearExplainer(model, X_background)
+
+        # Generic fallback — shap.Explainer picks Permutation/Kernel
+        logger.info(
+            "Using generic shap.Explainer for %s (may be slower).",
+            type(model).__name__,
+        )
+        if hasattr(model, "predict_proba"):
+            predict_fn = lambda X: model.predict_proba(X)[:, 1]  # noqa: E731
+        elif hasattr(model, "decision_function"):
+            predict_fn = model.decision_function
+        else:
+            predict_fn = model.predict
+        return shap.Explainer(predict_fn, X_background)
+
     def _log_shap_analysis(self, X_test: pd.DataFrame) -> None:
         """Generate SHAP explainability artifacts and log to MLflow."""
         max_display = 15
@@ -383,9 +438,12 @@ class TrainModelPipeline(Pipeline):
             logger.warning("Model not available; skipping SHAP analysis.")
             return
 
-        # TreeExplainer: exact SHAP for tree models (XGBoost, RF, LightGBM)
+        # Background sample for non-tree explainers
+        bg_n = int(self.config.get("shap_background_samples", 200))
+        X_background = X_test.sample(n=min(bg_n, len(X_test)), random_state=42)
+
         try:
-            explainer = shap.TreeExplainer(self.model)
+            explainer = self._make_shap_explainer(self.model, X_background)
         except Exception as e:
             logger.warning("SHAP analysis skipped (unsupported model type): %s", e)
             return
