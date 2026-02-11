@@ -459,9 +459,7 @@ class TrainModelPipeline(Pipeline):
             low, med, high = self.BUCKETS
 
             # Split into buckets
-            bucket_labels = pd.qcut(
-                proba, q=3, labels=self.BUCKETS, duplicates="drop"
-            )
+            bucket_labels = pd.qcut(proba, q=3, labels=self.BUCKETS, duplicates="drop")
             logger.info(f"Cohort sizes: {bucket_labels.value_counts().to_dict()}")
 
             # Create DataFrame with bucket labels for cohort grouping
@@ -522,7 +520,9 @@ class TrainModelPipeline(Pipeline):
                     feature_names=X_test.columns.tolist(),
                 )
                 plt.figure(figsize=(10, 8))
-                shap.plots.beeswarm(cohort_explanation, max_display=max_display, show=False)
+                shap.plots.beeswarm(
+                    cohort_explanation, max_display=max_display, show=False
+                )
                 beeswarm_path = shap_dir / f"shap_beeswarm_{bucket_name.lower()}.png"
                 plt.savefig(beeswarm_path, bbox_inches="tight", dpi=150)
                 plt.close()
