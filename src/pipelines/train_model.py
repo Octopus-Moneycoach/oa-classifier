@@ -6,7 +6,9 @@ from typing import Optional
 import matplotlib.pyplot as plt
 import mlflow
 import mlflow.sklearn
+import numpy as np
 import pandas as pd
+import shap
 import xgboost as xgb
 from dotenv import load_dotenv
 from imblearn.over_sampling import SMOTE
@@ -35,6 +37,8 @@ logger = logging.getLogger(__name__)
 
 class TrainModelPipeline(Pipeline):
     """End-to-end training pipeline."""
+
+    BUCKETS = ["Low", "Medium", "High"]
 
     def __init__(self, run_name: Optional[str] = None) -> None:
         """Initialise configuration and placeholders.
@@ -119,6 +123,9 @@ class TrainModelPipeline(Pipeline):
             # ROC on the test set
             self._log_roc_curve(X_test, y_test)
 
+            # SHAP analysis
+            self._log_shap_analysis(X_test, y_test)
+
             # Log model
             if self.model is not None:
                 mlflow.sklearn.log_model(self.model, artifact_path=self.model_name)
@@ -200,21 +207,21 @@ class TrainModelPipeline(Pipeline):
         """Bin prediction scores into Low/Medium/High with safe fallbacks."""
         scores = pd.Series(scores, index=scores.index)
         unique_count = scores.nunique(dropna=True)
+        low, med, high = self.BUCKETS
         if unique_count <= 1:
-            return pd.Series(["Medium"] * len(scores), index=scores.index)
+            return pd.Series([med] * len(scores), index=scores.index)
         try:
             cats = pd.qcut(scores, q=3, duplicates="drop")
             n_bins = len(cats.cat.categories)
             if n_bins == 1:
-                labels = ["Medium"]
+                labels = [med]
             elif n_bins == 2:
-                labels = ["Low", "High"]
+                labels = [low, high]
             else:
-                labels = ["Low", "Medium", "High"]
+                labels = self.BUCKETS
             return pd.qcut(scores, q=3, labels=labels, duplicates="drop")
         except ValueError:
-            labels = ["Low", "High"]
-            return pd.cut(scores, bins=2, labels=labels, include_lowest=True)
+            return pd.cut(scores, bins=2, labels=[low, high], include_lowest=True)
 
     def resample(
         self, X_train: pd.DataFrame, y_train: pd.Series
@@ -366,3 +373,353 @@ class TrainModelPipeline(Pipeline):
         mlflow.log_artifact(str(roc_path), artifact_path=roc_path.parent.name)
 
         logger.info("ROC curve saved locally to %s and logged to MLflow.", roc_path)
+
+    @staticmethod
+    def _is_tree_model(model: BaseEstimator) -> bool:
+        """Check if model is a tree-based estimator."""
+        from sklearn.tree import DecisionTreeClassifier
+
+        return isinstance(
+            model,
+            (
+                xgb.XGBClassifier,
+                RandomForestClassifier,
+                DecisionTreeClassifier,
+            ),
+        )
+
+    @staticmethod
+    def _is_linear_model(model: BaseEstimator) -> bool:
+        """Check if model is a linear estimator."""
+        from sklearn.linear_model import SGDClassifier
+        from sklearn.svm import LinearSVC
+
+        return isinstance(
+            model,
+            (LogisticRegression, SGDClassifier, LinearSVC),
+        )
+
+    def _make_shap_explainer(
+        self, model: BaseEstimator, X_background: pd.DataFrame
+    ) -> shap.Explainer:
+        """Create the appropriate SHAP explainer for the model type.
+
+        Tree models → TreeExplainer (exact, fast).
+        Linear models → LinearExplainer (exact for linear).
+        Everything else → shap.Explainer (Permutation/Kernel fallback).
+        """
+        if self._is_tree_model(model):
+            logger.info("Using TreeExplainer for %s.", type(model).__name__)
+            return shap.TreeExplainer(model)
+
+        if self._is_linear_model(model):
+            logger.info("Using LinearExplainer for %s.", type(model).__name__)
+            return shap.LinearExplainer(model, X_background)
+
+        # Generic fallback — shap.Explainer picks Permutation/Kernel
+        logger.info(
+            "Using generic shap.Explainer for %s (may be slower).",
+            type(model).__name__,
+        )
+        if hasattr(model, "predict_proba"):
+            predict_fn = lambda X: model.predict_proba(X)[:, 1]  # noqa: E731
+        elif hasattr(model, "decision_function"):
+            predict_fn = model.decision_function
+        else:
+            predict_fn = model.predict
+        return shap.Explainer(predict_fn, X_background)
+
+    @staticmethod
+    def _normalize_shap_explanation(
+        sv: object,
+        explainer: shap.Explainer,
+        X_test: pd.DataFrame,
+    ) -> shap.Explanation:
+        """Normalize SHAP output into a consistent Explanation object.
+
+        Handles: shap.Explanation (modern API), list of arrays (older binary),
+        2D arrays, and 3D arrays (multiclass).
+        """
+        if isinstance(sv, shap.Explanation):
+            explanation = sv
+            if explanation.values.ndim == 3 and explanation.values.shape[-1] > 1:
+                base = np.asarray(explanation.base_values)
+                explanation = shap.Explanation(
+                    values=explanation.values[:, :, 1],
+                    base_values=base[:, 1] if base.ndim == 2 else base[1],
+                    data=explanation.data,
+                    feature_names=explanation.feature_names,
+                )
+            return explanation
+
+        # Older explainers return ndarray or list
+        shap_values = sv
+        expected_value = getattr(explainer, "expected_value", 0.0)
+
+        if isinstance(shap_values, list):
+            shap_values = shap_values[1]
+        elif isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
+            shap_values = shap_values[:, :, 1]
+
+        if isinstance(expected_value, (list, np.ndarray)):
+            ev = np.asarray(expected_value)
+            if ev.ndim > 0:
+                expected_value = ev[1]
+
+        return shap.Explanation(
+            values=shap_values,
+            base_values=expected_value,
+            data=X_test.values,
+            feature_names=X_test.columns.tolist(),
+        )
+
+    def _log_shap_analysis(self, X_test: pd.DataFrame, y_test: pd.Series) -> None:
+        """Generate SHAP explainability artifacts and log to MLflow."""
+        max_display = 15
+        logger.info("Starting SHAP analysis.")
+
+        if self.model is None:
+            logger.warning("Model not available; skipping SHAP analysis.")
+            return
+
+        # Cap sample size for SHAP to bound runtime and artifact size
+        shap_max_samples = int(self.config.get("shap_max_samples", 1000))
+        if len(X_test) > shap_max_samples:
+            logger.info(
+                f"Sampling {shap_max_samples}/{len(X_test)} rows for SHAP analysis."
+            )
+            X_test = X_test.sample(n=shap_max_samples, random_state=42)
+            y_test = y_test.loc[X_test.index]
+
+        # Background sample for non-tree explainers
+        bg_n = int(self.config.get("shap_background_samples", 200))
+        X_background = X_test.sample(n=min(bg_n, len(X_test)), random_state=42)
+
+        try:
+            explainer = self._make_shap_explainer(self.model, X_background)
+        except Exception as e:
+            logger.warning("SHAP analysis skipped (unsupported model type): %s", e)
+            return
+
+        # Compute SHAP values and normalize into a consistent Explanation
+        sv = explainer.shap_values(X_test)
+        explanation = self._normalize_shap_explanation(sv, explainer, X_test)
+        shap_values = explanation.values
+        expected_value = explanation.base_values
+
+        # Log base rate for reference
+        if np.isscalar(expected_value) and isinstance(expected_value, (int, float)):
+            base_prob = 1 / (1 + np.exp(-expected_value))
+            logger.info(f"SHAP base probability: {base_prob:.1%}")
+
+        # Mean |SHAP| = average impact magnitude across all samples
+        mean_abs_shap = np.abs(shap_values).mean(axis=0)
+
+        # Create sorted DataFrame
+        feature_importance = pd.DataFrame(
+            {"feature": X_test.columns, "mean_abs_shap": mean_abs_shap}
+        ).sort_values("mean_abs_shap", ascending=False)
+
+        # Top features shown in SHAP plots
+        top_features = feature_importance.head(max_display)["feature"].tolist()
+        logger.info(f"Top SHAP features: {', '.join(top_features[:3])}")
+
+        plots_dir = Path(os.getenv("LOCAL_PLOTS_PATH", "outputs/plots"))
+        shap_dir = plots_dir / "shap"
+        shap_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save feature importance CSV
+        csv_path = shap_dir / "shap_feature_importance.csv"
+        feature_importance.to_csv(csv_path, index=False)
+        mlflow.log_artifact(str(csv_path), artifact_path="shap")
+
+        self._log_shap_bar(shap_values, X_test, shap_dir)
+        self._log_shap_beeswarm(shap_values, X_test, shap_dir, max_display)
+        self._log_shap_scatter(explanation, top_features, y_test, shap_dir)
+        self._log_shap_cohort(
+            shap_values, X_test, expected_value, shap_dir, max_display
+        )
+        self._log_shap_waterfall(explanation, X_test, shap_dir)
+
+        plt.close("all")
+        logger.info("SHAP analysis complete. Artifacts logged to MLflow.")
+
+    def _log_shap_bar(
+        self,
+        shap_values: np.ndarray,
+        X_test: pd.DataFrame,
+        shap_dir: Path,
+    ) -> None:
+        """Generate and log SHAP bar plot."""
+        plt.figure()
+        shap.summary_plot(shap_values, X_test, plot_type="bar", show=False)
+        bar_path = shap_dir / "shap_bar.png"
+        plt.savefig(bar_path, bbox_inches="tight", dpi=150)
+        plt.close()
+        mlflow.log_artifact(str(bar_path), artifact_path="shap")
+
+    def _log_shap_beeswarm(
+        self,
+        shap_values: np.ndarray,
+        X_test: pd.DataFrame,
+        shap_dir: Path,
+        max_display: int,
+    ) -> None:
+        """Generate and log SHAP beeswarm plot."""
+        plt.figure()
+        shap.summary_plot(shap_values, X_test, max_display=max_display, show=False)
+        summary_path = shap_dir / "shap_beeswarm.png"
+        plt.savefig(summary_path, bbox_inches="tight", dpi=150)
+        plt.close()
+        mlflow.log_artifact(str(summary_path), artifact_path="shap")
+
+    def _log_shap_scatter(
+        self,
+        explanation: shap.Explanation,
+        features: list[str],
+        y_test: pd.Series,
+        shap_dir: Path,
+    ) -> None:
+        """Generate and log SHAP scatter plots for given features."""
+        for feat in features:
+            safe_name = feat.lower().replace("/", "_").replace(" ", "_")
+
+            # Interaction-colored scatter (auto-detect best interaction feature)
+            plt.figure()
+            shap.plots.scatter(explanation[:, feat], color=explanation, show=False)
+            scatter_path = shap_dir / f"shap_scatter_{safe_name}.png"
+            plt.savefig(scatter_path, bbox_inches="tight", dpi=150)
+            plt.close()
+            mlflow.log_artifact(str(scatter_path), artifact_path="shap")
+
+            # Target-colored scatter (how SHAP values vary across classes)
+            plt.figure()
+            shap.plots.scatter(
+                explanation[:, feat],
+                color=y_test.values,
+                show=False,
+            )
+            target_path = shap_dir / f"shap_scatter_{safe_name}_by_target.png"
+            plt.savefig(target_path, bbox_inches="tight", dpi=150)
+            plt.close()
+            mlflow.log_artifact(str(target_path), artifact_path="shap")
+
+    def _log_shap_cohort(
+        self,
+        shap_values: np.ndarray,
+        X_test: pd.DataFrame,
+        expected_value: float,
+        shap_dir: Path,
+        max_display: int,
+    ) -> None:
+        """Generate and log SHAP cohort analysis artifacts."""
+        if self.model is None or not hasattr(self.model, "predict_proba"):
+            return
+
+        proba = self.model.predict_proba(X_test)[:, 1]
+        high = self.BUCKETS[-1]
+        low, med = self.BUCKETS[0], self.BUCKETS[1]
+
+        # Split into buckets — handle fewer bins when duplicates are dropped
+        bucket_labels = pd.qcut(pd.Series(proba), q=3, duplicates="drop")
+        n_bins = len(bucket_labels.cat.categories)
+        if n_bins == 1:
+            labels = [med]
+        elif n_bins == 2:
+            labels = [low, high]
+        else:
+            labels = self.BUCKETS
+        bucket_labels = pd.qcut(pd.Series(proba), q=3, labels=labels, duplicates="drop")
+        active_buckets = [b for b in labels if (bucket_labels == b).any()]
+        logger.info(f"Cohort sizes: {bucket_labels.value_counts().to_dict()}")
+
+        # Create DataFrame with bucket labels for cohort grouping
+        shap_df = pd.DataFrame(shap_values, columns=X_test.columns, index=X_test.index)
+        shap_df["bucket"] = np.array(bucket_labels, dtype=str)
+
+        # Absolute SHAP cohort analysis (magnitude regardless of direction)
+        shap_abs_df = pd.DataFrame(
+            np.abs(shap_values), columns=X_test.columns, index=X_test.index
+        )
+        shap_abs_df["bucket"] = np.array(bucket_labels, dtype=str)
+
+        cohort_abs_shap = shap_abs_df.groupby("bucket", observed=True).mean().T
+        cohort_abs_shap.index.name = "feature"
+        cohort_abs_shap = cohort_abs_shap.reset_index()
+
+        cols_abs = ["feature"] + [
+            c for c in active_buckets if c in cohort_abs_shap.columns
+        ]
+        cohort_abs_shap = cohort_abs_shap[cols_abs]
+
+        # Sort by highest absolute impact in "High" bucket
+        if high in cohort_abs_shap.columns:
+            cohort_abs_shap = cohort_abs_shap.sort_values(high, ascending=False)
+
+        cohort_abs_path = shap_dir / "shap_cohort_abs_analysis.csv"
+        cohort_abs_shap.to_csv(cohort_abs_path, index=False)
+        mlflow.log_artifact(str(cohort_abs_path), artifact_path="shap")
+
+        # SHAP grouped bar plot by cohort - absolute (magnitude)
+        cohort_abs_explanations = {}
+        for bucket_name in active_buckets:
+            mask = shap_df["bucket"] == bucket_name
+            bucket_shap = shap_values[mask.values]
+            cohort_abs_explanations[bucket_name] = shap.Explanation(
+                values=bucket_shap,
+                base_values=expected_value,
+                data=X_test[mask].values,
+                feature_names=X_test.columns.tolist(),
+            )
+
+        plt.figure()
+        shap.plots.bar(cohort_abs_explanations, show=False)
+        cohort_abs_chart_path = shap_dir / "shap_cohort_abs_chart.png"
+        plt.savefig(cohort_abs_chart_path, bbox_inches="tight", dpi=150)
+        plt.close()
+        mlflow.log_artifact(str(cohort_abs_chart_path), artifact_path="shap")
+
+        # Beeswarm plots per cohort (shows direction + distribution)
+        for bucket_name in active_buckets:
+            mask = shap_df["bucket"] == bucket_name
+            cohort_explanation = shap.Explanation(
+                values=shap_values[mask.values],
+                base_values=expected_value,
+                data=X_test[mask].values,
+                feature_names=X_test.columns.tolist(),
+            )
+            plt.figure(figsize=(10, 8))
+            shap.plots.beeswarm(cohort_explanation, max_display=max_display, show=False)
+            beeswarm_path = shap_dir / f"shap_beeswarm_{bucket_name.lower()}.png"
+            plt.savefig(beeswarm_path, bbox_inches="tight", dpi=150)
+            plt.close()
+            mlflow.log_artifact(str(beeswarm_path), artifact_path="shap")
+
+        logger.info("SHAP cohort analysis saved.")
+
+    def _log_shap_waterfall(
+        self,
+        explanation: shap.Explanation,
+        X_test: pd.DataFrame,
+        shap_dir: Path,
+    ) -> None:
+        """Generate and log SHAP waterfall plots for representative samples."""
+        if self.model is None or not hasattr(self.model, "predict_proba"):
+            return
+
+        proba = self.model.predict_proba(X_test)[:, 1]
+        low, med, high = self.BUCKETS
+
+        samples = {
+            low: int(np.argmin(proba)),
+            med: int(np.argsort(proba)[len(proba) // 2]),
+            high: int(np.argmax(proba)),
+        }
+
+        for label, idx in samples.items():
+            plt.figure()
+            shap.plots.waterfall(explanation[idx], show=False)
+            waterfall_path = shap_dir / f"shap_waterfall_{label.lower()}.png"
+            plt.savefig(waterfall_path, bbox_inches="tight", dpi=150)
+            plt.close()
+            mlflow.log_artifact(str(waterfall_path), artifact_path="shap")

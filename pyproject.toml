@@ -14,7 +14,7 @@ pipeline = "oa_classifier.main:main"
 
 [tool.poetry.dependencies]
 python = ">=3.12,<3.13"
-numpy = ">=1.26,<2.0"
+numpy = ">=2.0"
 pandas = "^2.3.2"
 pyarrow = ">=14,<18"
 mlflow = "^3.5.0"
@@ -27,7 +27,7 @@ pyyaml = "*"
 types-pyyaml = "^6.0.12.12"
 openpyxl = "^3.1.2"
 seaborn = "^0.13.0"
-pandera = "^0.18.0"
+pandera = ">=0.20"
 tomli = "^2.0.1"
 fsspec = "^2024.10.0"
 azure-ai-ml = "^1.26.2"
@@ -38,6 +38,7 @@ cryptography = ">=41,<45"
 azure-keyvault = "^4.2.0"
 boto3 = "^1.42.30"
 imbalanced-learn = "^0.14.1"
+shap = "^0.50.0"
 
 
 [tool.poetry.group.dev.dependencies]
