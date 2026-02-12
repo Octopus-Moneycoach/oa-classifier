@@ -1,6 +1,8 @@
 import logging
 
+import numpy as np
 import pandas as pd
+from sklearn.model_selection import KFold
 from sklearn.preprocessing import LabelEncoder, OneHotEncoder
 
 from src.pipelines.pipeline import Pipeline
@@ -27,7 +29,7 @@ class PrepareDataPipeline(Pipeline):
         # remember to exclude data leakage columns from transformations and encoding, and to not apply same transformations to target column as to features
         df = read_data(
             sql_query="""
-                select * exclude (OA_PURCHASE_DATE) from TEST_DS_DATABASE.PUBLIC.OA_DATASET
+                select * exclude (OA_PURCHASE_DATE) from TEST_DS_DATABASE.PUBLIC.VW_OA_DATASET
             """,
             schema_obj=None,  # Ignore schema validation for now
         )
@@ -50,8 +52,16 @@ class PrepareDataPipeline(Pipeline):
                     "PLAN_ACTIVATED_DATE",
                 ],
                 target_col="HASOA",
-            )  # no date columns for now
-            # Don't encode high cardinality columns here
+            )
+            .pipe(
+                self._kfold_target_encoder,
+                cols=[
+                    "EMPLOYER_NAME",
+                    "INDUSTRY",
+                    "COACH_NAME",
+                ],  # Choose high cardinality categorical columns to encode
+                # default params: target_col="HASOA", n_splits=5, smoothing=10.0, random_state=42, suffix="_TE" )
+            )
             .pipe(
                 self._encoder,
                 cat_cols=[
@@ -61,6 +71,7 @@ class PrepareDataPipeline(Pipeline):
                 id_col="HARBOUR_ID",
                 target_col="HASOA",
             )
+            .pipe(self._column_rearrange, target_col="HASOA")
         )
         logger.info("Data preparation transformations applied. Shape: %s", df.shape)
 
@@ -181,10 +192,8 @@ class PrepareDataPipeline(Pipeline):
         if missing_cols:
             raise ValueError(f"Column(s) {missing_cols} not found in DataFrame.")
 
-        # assert df[cat_cols].dtypes.isin(["object", "category"]).all(), "cat_cols must be categorical columns"
-        assert (
-            id_col not in cat_cols and target_col not in cat_cols
-        ), "id_col and target_col should not be in cat_cols"
+        if id_col in cat_cols or target_col in cat_cols:
+            raise ValueError("id_col and target_col should not be in cat_cols list.")
 
         for col in cat_cols:
             col_encoded = ohc.fit_transform(df[[col]])
@@ -195,8 +204,73 @@ class PrepareDataPipeline(Pipeline):
                 c.replace(" ", "_").replace("-", "_").upper() for c in col_df.columns
             ]
             df = pd.concat([df.drop(columns=[col]), col_df], axis=1)
-
-        # rearrange columns to keep target at the end
-        cols = [c for c in df.columns if c != target_col] + [target_col]
-        df = df[cols]
         return df
+
+    @staticmethod
+    def _kfold_target_encoder(
+        df: pd.DataFrame,
+        cols: list[str],
+        target_col: str = "HASOA",
+        n_splits: int = 5,
+        smoothing: float = 10.0,
+        random_state: int | None = None,
+        suffix: str = "_TE",
+    ) -> pd.DataFrame:
+        """K-Fold target encoding for high-cardinality categorical features.
+
+        Leakage-safe when used BEFORE train-test split.
+
+        Args:
+            df: Input DataFrame.
+            cols: List of high-cardinality categorical columns to encode.
+            target_col: Target column to calculate mean encoding.
+            n_splits: Number of folds for K-Fold encoding.
+            smoothing: Smoothing effect to balance categorical average vs global average.
+            random_state: Random state for reproducibility.
+            suffix: Suffix to append to encoded column names.
+
+        """
+        df = df.copy()
+        if target_col not in df.columns:
+            raise ValueError("target_col must be a column in the DataFrame")
+
+        global_mean = df[target_col].mean()
+
+        n_samples = len(df)
+        if n_samples < 2:
+            raise ValueError("n_samples must be at least 2 for K-Fold encoding")
+        effective_splits = min(n_splits, n_samples)
+
+        kf = KFold(n_splits=effective_splits, shuffle=True, random_state=random_state)
+
+        # Accept object, category, and pandas string dtypes as categorical.
+        invalid_cols = [
+            col
+            for col in cols
+            if not (
+                pd.api.types.is_object_dtype(df[col])
+                or isinstance(df[col].dtype, pd.CategoricalDtype)
+                or pd.api.types.is_string_dtype(df[col])
+            )
+        ]
+        if invalid_cols:
+            raise ValueError("cols must be categorical columns")
+
+        for col in cols:
+            encoded = np.zeros(len(df))
+
+            for train_idx, val_idx in kf.split(df):
+                train_fold, val_fold = df.iloc[train_idx], df.iloc[val_idx]
+                stats = train_fold.groupby(col)[target_col].agg(["mean", "count"])
+                smooth = (stats["count"] * stats["mean"] + smoothing * global_mean) / (
+                    stats["count"] + smoothing
+                )
+                encoded[val_idx] = val_fold[col].map(smooth).fillna(global_mean).values
+                df[f"{col}{suffix}"] = encoded
+        return df
+
+    @staticmethod
+    def _column_rearrange(df: pd.DataFrame, target_col: str = "HASOA") -> pd.DataFrame:
+        """Rearrange columns to keep target column at the end."""
+        cols = [c for c in df.columns if c != target_col] + [target_col]
+        return df[cols]
