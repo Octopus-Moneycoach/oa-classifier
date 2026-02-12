@@ -24,37 +24,41 @@ class PrepareDataPipeline(Pipeline):
         """Execute the data preparation workflow end to end."""
         logger.info("Starting the data preparation pipeline.")
 
+        # remember to exclude data leakage columns from transformations and encoding, and to not apply same transformations to target column as to features
         df = read_data(
             sql_query="""
-                select
-                    dc.idpuserid as HARBOURID,
-                    dc.gender as GENDER,
-                    year(sysdate()) - dc.yeardob as AGE,
-                    dc.channel as CHANNEL,
-                    de.name as EMPLOYERNAME,
-                    case
-                        when fcj.oastatus in ('Active', 'Completed') then 'Yes'
-                        else 'No'
-                    end as HASOA
-                from prod_analytics.fact_clientjourney fcj
-                inner join prod_analytics.dim_client dc on fcj.clientkey = dc.clientkey
-                left join prod_analytics.dim_employer de on fcj.employerkey = de.employerkey
-                where 1 = 1
-                and pmgstatus in ('Active', 'Completed')
+                select * exclude (OA_PURCHASE_DATE) from TEST_DS_DATABASE.PUBLIC.OA_DATASET
             """,
-            schema_obj="input_data",  # Ignore schema validation for now
+            schema_obj=None,  # Ignore schema validation for now
         )
         logger.info("Input data read. Shape: %s", df.shape)
 
         df = (
-            df.pipe(self._dedup, idx_col="HARBOURID")
+            df.pipe(self._dedup, idx_col="HARBOUR_ID")
             .pipe(self._impute)
-            # .pipe(self._feature_engineer, cols=["AGE"], target_col="HASOA") # omitted for now
+            # .pipe(self._feature_engineer_int, cols=["AGE"], target_col="HASOA") # omitted for now
+            .pipe(
+                self._feature_engineer_date,
+                date_cols=[
+                    "EQ_SUBMITTED_DATE",
+                    "PMG_START_DATE",
+                    "PLANNING_SESSION_CREATED_DATE",
+                    "PLANNING_SESSION_DATE",
+                    "ACTION_SESSION_CREATED_DATE",
+                    "ACTION_SESSION_DATE",
+                    "FIRST_FORECAST_CREATION_DATE",
+                    "PLAN_ACTIVATED_DATE",
+                ],
+                target_col="HASOA",
+            )  # no date columns for now
             # Don't encode high cardinality columns here
             .pipe(
                 self._encoder,
-                cat_cols=["GENDER", "CHANNEL"],
-                id_col="HARBOURID",
+                cat_cols=[
+                    "GENDER",
+                    "CHANNEL",
+                ],  # Choose low cardinality categorical columns to encode
+                id_col="HARBOUR_ID",
                 target_col="HASOA",
             )
         )
@@ -70,7 +74,7 @@ class PrepareDataPipeline(Pipeline):
         logger.info("Processed data saved.")
 
     @staticmethod
-    def _dedup(df: pd.DataFrame, idx_col: str = "HARBOURID") -> pd.DataFrame:
+    def _dedup(df: pd.DataFrame, idx_col: str = "HARBOUR_ID") -> pd.DataFrame:
         """Drop duplicate rows based on index column."""
         df = df.drop_duplicates(subset=[idx_col]).reset_index(drop=True)
         return df
@@ -98,8 +102,9 @@ class PrepareDataPipeline(Pipeline):
         df[cat_cols] = df[cat_cols].fillna("Unknown")
         return df
 
+    # TODO: create different feature engineering functions for different types of data.
     @staticmethod
-    def _feature_engineer(
+    def _feature_engineer_int(
         df: pd.DataFrame, cols: list[str], bins: int = 11, target_col: str = "HASOA"
     ) -> pd.DataFrame:
         """Feature engineer binned numerical columns.
@@ -129,10 +134,30 @@ class PrepareDataPipeline(Pipeline):
         return df
 
     @staticmethod
+    def _feature_engineer_date(
+        df: pd.DataFrame, date_cols: list[str], target_col: str = "HASOA"
+    ) -> pd.DataFrame:
+        """Feature engineer date columns into year, month, day.
+
+        Args:
+            df: Input DataFrame.
+            date_cols: List of date columns to transform.
+            target_col: Target column to exclude from transformation.
+        """
+        for col in date_cols:
+            if col in df.columns and col != target_col:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+                df[f"{col}_YEAR"] = df[col].dt.year
+                df[f"{col}_MONTH"] = df[col].dt.month
+                df[f"{col}_DAY"] = df[col].dt.day
+                df.drop(columns=[col], inplace=True)
+        return df
+
+    @staticmethod
     def _encoder(
         df: pd.DataFrame,
         cat_cols: list[str],
-        id_col: str = "HARBOURID",
+        id_col: str = "HARBOUR_ID",
         target_col: str = "HASOA",
     ) -> pd.DataFrame:
         """Encode target and categorical columns using Label Encoding and One-Hot Encoding.
