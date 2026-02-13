@@ -26,10 +26,16 @@ class PrepareDataPipeline(Pipeline):
         """Execute the data preparation workflow end to end."""
         logger.info("Starting the data preparation pipeline.")
 
-        # remember to exclude data leakage columns from transformations and encoding, and to not apply same transformations to target column as to features
+        # source data from Snowflake view - two potential target fields: HASOA and target_date (churn within 8 weeks of PMG start date)
         df = read_data(
             sql_query="""
-                select * exclude (OA_PURCHASE_DATE) from TEST_DS_DATABASE.PUBLIC.VW_OA_DATASET
+                select
+                    * exclude(
+                        oa_purchase_date,
+                        churn_date,
+                        target_date, -- alternate target field to HASOA,
+                        days_between_pmg_signup_and_oa_signup)
+                from TEST_DS_DATABASE.PUBLIC.VW_OA_DATASET
             """,
             schema_obj=None,  # Ignore schema validation for now
         )
@@ -129,7 +135,8 @@ class PrepareDataPipeline(Pipeline):
         assert (
             df[cols].dtypes.isin(["int64", "float64"]).all()
         ), "All cols must be numerical."
-        assert bins > 1, "Number of bins must be greater than 1."
+        if bins < 2:
+            raise ValueError("bins must be at least 2.")
         for col in cols:
             if col in df.columns and col != target_col:
                 # Use pd.qcut to create quantile bins and generate appropriate labels
@@ -161,7 +168,12 @@ class PrepareDataPipeline(Pipeline):
                 df[f"{col}_YEAR"] = df[col].dt.year
                 df[f"{col}_MONTH"] = df[col].dt.month
                 df[f"{col}_DAY"] = df[col].dt.day
-                df.drop(columns=[col], inplace=True)
+                df = df.drop(columns=[col])
+            else:
+                logging.warning(
+                    "Date column '%s' not found in DataFrame; skipping feature engineering.",
+                    col,
+                )
         return df
 
     @staticmethod
@@ -213,7 +225,7 @@ class PrepareDataPipeline(Pipeline):
         target_col: str = "HASOA",
         n_splits: int = 5,
         smoothing: float = 10.0,
-        random_state: int | None = None,
+        random_state: int | None = 42,
         suffix: str = "_TE",
     ) -> pd.DataFrame:
         """K-Fold target encoding for high-cardinality categorical features.
@@ -230,7 +242,7 @@ class PrepareDataPipeline(Pipeline):
             suffix: Suffix to append to encoded column names.
 
         """
-        df = df.copy()
+        df = df.copy(deep=False)
         if target_col not in df.columns:
             raise ValueError("target_col must be a column in the DataFrame")
 
@@ -254,7 +266,7 @@ class PrepareDataPipeline(Pipeline):
             )
         ]
         if invalid_cols:
-            raise ValueError("cols must be categorical columns")
+            raise ValueError(f"Columns {invalid_cols} must be categorical columns")
 
         for col in cols:
             encoded = np.zeros(len(df))
@@ -262,11 +274,13 @@ class PrepareDataPipeline(Pipeline):
             for train_idx, val_idx in kf.split(df):
                 train_fold, val_fold = df.iloc[train_idx], df.iloc[val_idx]
                 stats = train_fold.groupby(col)[target_col].agg(["mean", "count"])
-                smooth = (stats["count"] * stats["mean"] + smoothing * global_mean) / (
-                    stats["count"] + smoothing
+                smoothed_encoding = (
+                    stats["count"] * stats["mean"] + smoothing * global_mean
+                ) / (stats["count"] + smoothing)
+                encoded[val_idx] = (
+                    val_fold[col].map(smoothed_encoding).fillna(global_mean).values
                 )
-                encoded[val_idx] = val_fold[col].map(smooth).fillna(global_mean).values
-                df[f"{col}{suffix}"] = encoded
+            df[f"{col}{suffix}"] = encoded
         return df
 
     @staticmethod
