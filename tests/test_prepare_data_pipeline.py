@@ -10,12 +10,14 @@ from src.pipelines.prepare_data import PrepareDataPipeline
 def sample_df_fixture():
     return pd.DataFrame(
         {
-            "HARBOURID": [101, 102, 103],
+            "HARBOUR_ID": [101, 102, 103],
             "GENDER": ["F", "M", "F"],
             "AGE": [29, 41, 35],
             "CHANNEL": ["Web", "Phone", "Web"],
-            "EMPLOYERNAME": ["Acme", "Beta", "Acme"],
-            "HASOA": ["Yes", "No", "Yes"],
+            "INDUSTRY": ["Tech", "Finance", "Tech"],
+            "EMPLOYER_NAME": ["Acme", "Beta", "Acme"],
+            "COACH_NAME": ["Alice", "Bob", "Charlie"],
+            "HASOA": [1, 0, 1],
         }
     )
 
@@ -30,11 +32,15 @@ def test_run_pipeline(data):
 
         mock_read.assert_called_once()
         _, read_kwargs = mock_read.call_args
-        assert read_kwargs["schema_obj"] == "input_data"
+        assert (
+            read_kwargs["schema_obj"] is None
+        )  # "input_data" add back schema validation once implemented
         assert "select" in read_kwargs["sql_query"].lower()
 
         mock_write.assert_called_once()
         _, kwargs = mock_write.call_args
         print(kwargs)
         assert kwargs["table_name"] == "OA_DATASET_PREPARED"
-        assert kwargs["schema_obj"] is None
+        assert (
+            kwargs["schema_obj"] is None
+        )  # "prepared_data" add back schema validation once implemented

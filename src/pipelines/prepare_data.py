@@ -1,6 +1,8 @@
 import logging
 
+import numpy as np
 import pandas as pd
+from sklearn.model_selection import KFold
 from sklearn.preprocessing import LabelEncoder, OneHotEncoder
 
 from src.pipelines.pipeline import Pipeline
@@ -24,39 +26,58 @@ class PrepareDataPipeline(Pipeline):
         """Execute the data preparation workflow end to end."""
         logger.info("Starting the data preparation pipeline.")
 
+        # source data from Snowflake view - two potential target fields: HASOA and target_date (churn within 8 weeks of PMG start date)
         df = read_data(
             sql_query="""
                 select
-                    dc.idpuserid as HARBOURID,
-                    dc.gender as GENDER,
-                    year(sysdate()) - dc.yeardob as AGE,
-                    dc.channel as CHANNEL,
-                    de.name as EMPLOYERNAME,
-                    case
-                        when fcj.oastatus in ('Active', 'Completed') then 'Yes'
-                        else 'No'
-                    end as HASOA
-                from prod_analytics.fact_clientjourney fcj
-                inner join prod_analytics.dim_client dc on fcj.clientkey = dc.clientkey
-                left join prod_analytics.dim_employer de on fcj.employerkey = de.employerkey
-                where 1 = 1
-                and pmgstatus in ('Active', 'Completed')
+                    * exclude(
+                        oa_purchase_date,
+                        churn_date,
+                        target_date, -- alternate target field to HASOA,
+                        days_between_pmg_signup_and_oa_signup)
+                from TEST_DS_DATABASE.PUBLIC.VW_OA_DATASET
             """,
-            schema_obj="input_data",  # Ignore schema validation for now
+            schema_obj=None,  # Ignore schema validation for now
         )
         logger.info("Input data read. Shape: %s", df.shape)
 
         df = (
-            df.pipe(self._dedup, idx_col="HARBOURID")
+            df.pipe(self._dedup, idx_col="HARBOUR_ID")
             .pipe(self._impute)
-            # .pipe(self._feature_engineer, cols=["AGE"], target_col="HASOA") # omitted for now
-            # Don't encode high cardinality columns here
+            # .pipe(self._feature_engineer_int, cols=["AGE"], target_col="HASOA") # omitted for now
             .pipe(
-                self._encoder,
-                cat_cols=["GENDER", "CHANNEL"],
-                id_col="HARBOURID",
+                self._feature_engineer_date,
+                date_cols=[
+                    "EQ_SUBMITTED_DATE",
+                    "PMG_START_DATE",
+                    "PLANNING_SESSION_CREATED_DATE",
+                    "PLANNING_SESSION_DATE",
+                    "ACTION_SESSION_CREATED_DATE",
+                    "ACTION_SESSION_DATE",
+                    "FIRST_FORECAST_CREATION_DATE",
+                    "PLAN_ACTIVATED_DATE",
+                ],
                 target_col="HASOA",
             )
+            .pipe(
+                self._kfold_target_encoder,
+                cols=[
+                    "EMPLOYER_NAME",
+                    "INDUSTRY",
+                    "COACH_NAME",
+                ],  # Choose high cardinality categorical columns to encode
+                # default params: target_col="HASOA", n_splits=5, smoothing=10.0, random_state=42, suffix="_TE" )
+            )
+            .pipe(
+                self._encoder,
+                cat_cols=[
+                    "GENDER",
+                    "CHANNEL",
+                ],  # Choose low cardinality categorical columns to encode
+                id_col="HARBOUR_ID",
+                target_col="HASOA",
+            )
+            .pipe(self._column_rearrange, target_col="HASOA")
         )
         logger.info("Data preparation transformations applied. Shape: %s", df.shape)
 
@@ -70,7 +91,7 @@ class PrepareDataPipeline(Pipeline):
         logger.info("Processed data saved.")
 
     @staticmethod
-    def _dedup(df: pd.DataFrame, idx_col: str = "HARBOURID") -> pd.DataFrame:
+    def _dedup(df: pd.DataFrame, idx_col: str = "HARBOUR_ID") -> pd.DataFrame:
         """Drop duplicate rows based on index column."""
         df = df.drop_duplicates(subset=[idx_col]).reset_index(drop=True)
         return df
@@ -98,8 +119,9 @@ class PrepareDataPipeline(Pipeline):
         df[cat_cols] = df[cat_cols].fillna("Unknown")
         return df
 
+    # TODO: create different feature engineering functions for different types of data.
     @staticmethod
-    def _feature_engineer(
+    def _feature_engineer_int(
         df: pd.DataFrame, cols: list[str], bins: int = 11, target_col: str = "HASOA"
     ) -> pd.DataFrame:
         """Feature engineer binned numerical columns.
@@ -113,7 +135,8 @@ class PrepareDataPipeline(Pipeline):
         assert (
             df[cols].dtypes.isin(["int64", "float64"]).all()
         ), "All cols must be numerical."
-        assert bins > 1, "Number of bins must be greater than 1."
+        if bins < 2:
+            raise ValueError("bins must be at least 2.")
         for col in cols:
             if col in df.columns and col != target_col:
                 # Use pd.qcut to create quantile bins and generate appropriate labels
@@ -129,10 +152,35 @@ class PrepareDataPipeline(Pipeline):
         return df
 
     @staticmethod
+    def _feature_engineer_date(
+        df: pd.DataFrame, date_cols: list[str], target_col: str = "HASOA"
+    ) -> pd.DataFrame:
+        """Feature engineer date columns into year, month, day.
+
+        Args:
+            df: Input DataFrame.
+            date_cols: List of date columns to transform.
+            target_col: Target column to exclude from transformation.
+        """
+        for col in date_cols:
+            if col in df.columns and col != target_col:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+                df[f"{col}_YEAR"] = df[col].dt.year
+                df[f"{col}_MONTH"] = df[col].dt.month
+                df[f"{col}_DAY"] = df[col].dt.day
+                df = df.drop(columns=[col])
+            else:
+                logging.warning(
+                    "Date column '%s' not found in DataFrame; skipping feature engineering.",
+                    col,
+                )
+        return df
+
+    @staticmethod
     def _encoder(
         df: pd.DataFrame,
         cat_cols: list[str],
-        id_col: str = "HARBOURID",
+        id_col: str = "HARBOUR_ID",
         target_col: str = "HASOA",
     ) -> pd.DataFrame:
         """Encode target and categorical columns using Label Encoding and One-Hot Encoding.
@@ -156,10 +204,8 @@ class PrepareDataPipeline(Pipeline):
         if missing_cols:
             raise ValueError(f"Column(s) {missing_cols} not found in DataFrame.")
 
-        # assert df[cat_cols].dtypes.isin(["object", "category"]).all(), "cat_cols must be categorical columns"
-        assert (
-            id_col not in cat_cols and target_col not in cat_cols
-        ), "id_col and target_col should not be in cat_cols"
+        if id_col in cat_cols or target_col in cat_cols:
+            raise ValueError("id_col and target_col should not be in cat_cols list.")
 
         for col in cat_cols:
             col_encoded = ohc.fit_transform(df[[col]])
@@ -170,8 +216,75 @@ class PrepareDataPipeline(Pipeline):
                 c.replace(" ", "_").replace("-", "_").upper() for c in col_df.columns
             ]
             df = pd.concat([df.drop(columns=[col]), col_df], axis=1)
-
-        # rearrange columns to keep target at the end
-        cols = [c for c in df.columns if c != target_col] + [target_col]
-        df = df[cols]
         return df
+
+    @staticmethod
+    def _kfold_target_encoder(
+        df: pd.DataFrame,
+        cols: list[str],
+        target_col: str = "HASOA",
+        n_splits: int = 5,
+        smoothing: float = 10.0,
+        random_state: int | None = 42,
+        suffix: str = "_TE",
+    ) -> pd.DataFrame:
+        """K-Fold target encoding for high-cardinality categorical features.
+
+        Leakage-safe when used BEFORE train-test split.
+
+        Args:
+            df: Input DataFrame.
+            cols: List of high-cardinality categorical columns to encode.
+            target_col: Target column to calculate mean encoding.
+            n_splits: Number of folds for K-Fold encoding.
+            smoothing: Smoothing effect to balance categorical average vs global average.
+            random_state: Random state for reproducibility.
+            suffix: Suffix to append to encoded column names.
+
+        """
+        df = df.copy(deep=False)
+        if target_col not in df.columns:
+            raise ValueError("target_col must be a column in the DataFrame")
+
+        global_mean = df[target_col].mean()
+
+        n_samples = len(df)
+        if n_samples < 2:
+            raise ValueError("n_samples must be at least 2 for K-Fold encoding")
+        effective_splits = min(n_splits, n_samples)
+
+        kf = KFold(n_splits=effective_splits, shuffle=True, random_state=random_state)
+
+        # Accept object, category, and pandas string dtypes as categorical.
+        invalid_cols = [
+            col
+            for col in cols
+            if not (
+                pd.api.types.is_object_dtype(df[col])
+                or isinstance(df[col].dtype, pd.CategoricalDtype)
+                or pd.api.types.is_string_dtype(df[col])
+            )
+        ]
+        if invalid_cols:
+            raise ValueError(f"Columns {invalid_cols} must be categorical columns")
+
+        for col in cols:
+            encoded = np.zeros(len(df))
+
+            for train_idx, val_idx in kf.split(df):
+                train_fold, val_fold = df.iloc[train_idx], df.iloc[val_idx]
+                stats = train_fold.groupby(col)[target_col].agg(["mean", "count"])
+                smoothed_encoding = (
+                    stats["count"] * stats["mean"] + smoothing * global_mean
+                ) / (stats["count"] + smoothing)
+                encoded[val_idx] = (
+                    val_fold[col].map(smoothed_encoding).fillna(global_mean).values
+                )
+            df[f"{col}{suffix}"] = encoded
+        return df
+
+    @staticmethod
+    def _column_rearrange(df: pd.DataFrame, target_col: str = "HASOA") -> pd.DataFrame:
+        """Rearrange columns to keep target column at the end."""
+        cols = [c for c in df.columns if c != target_col] + [target_col]
+        return df[cols]
